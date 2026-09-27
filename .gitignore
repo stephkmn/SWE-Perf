@@ -4,6 +4,7 @@ datasets/claude_code_workspaces/
 datasets/logs/
 datasets/base_datasets/
 datasets/outputs/claude_code_logs/
+datasets/outputs/smoke_test_outputs
 
 # Python
 __pycache__/
