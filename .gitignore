@@ -10,3 +10,7 @@ datasets/outputs/smoke_test_outputs
 __pycache__/
 *.pyc
 .venv/
+
+# Analysis tooling outputs
+analysis/analysis_out/
+.pytest_cache/
