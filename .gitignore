@@ -14,3 +14,4 @@ __pycache__/
 # Analysis tooling outputs
 analysis/analysis_out/
 .pytest_cache/
+datasets/
