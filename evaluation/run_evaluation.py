@@ -58,6 +58,23 @@ class EvaluationError(Exception):
         )
 
 
+# Fields written by the memory plugin in test_spec.MEM_PLUGIN_SOURCE. They live
+# in each repeat's report*.json under "metadata"; carry them into the aggregated
+# report.json so check_evaluation can read memory beside duration. Absent for
+# runs produced before the plugin existed, hence the per-key guard.
+MEM_FIELDS = (
+    "rss_before_kb", "rss_after_kb",
+    "maxrss_before_kb", "maxrss_after_kb",
+    "rss_growth_kb", "maxrss_growth_kb",
+)
+
+
+def mem_fields(test_entry):
+    """Pull the memory plugin's readings out of one pytest-json-report entry."""
+    meta = test_entry.get("metadata") or {}
+    return {k: meta[k] for k in MEM_FIELDS if k in meta}
+
+
 def run_instance(
         test_spec: TestSpec,
         pred: dict,
@@ -242,14 +259,22 @@ def run_instance(
                 with open(base_path, "r") as f:
                     base_report = json.load(f)
                 for t in base_report['tests']:
-                    report[t['nodeid']]["base"][idx] = {"outcome": t["outcome"], "duration": t["call"]["duration"]}
+                    report[t['nodeid']]["base"][idx] = {
+                        "outcome": t["outcome"],
+                        "duration": t["call"]["duration"],
+                        **mem_fields(t),
+                    }
             else:
                 break
             if human_path.exists():
                 with open(human_path, "r") as f:
                     human_report = json.load(f)
                 for t in human_report['tests']:
-                    report[t['nodeid']]["human"][idx] = {"outcome": t["outcome"], "duration": t["call"]["duration"]}
+                    report[t['nodeid']]["human"][idx] = {
+                        "outcome": t["outcome"],
+                        "duration": t["call"]["duration"],
+                        **mem_fields(t),
+                    }
             else:
                 print(f"Warning: No human report found for {instance_id}, skipping...")
                 break
