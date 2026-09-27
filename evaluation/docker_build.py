@@ -490,6 +490,13 @@ def build_instance_image(
         close_logger(logger)
 
 
+# TEMPORARY local resource clamp -- see the note in build_container().
+# Set to fit Docker Desktop's allocation on this machine (8 CPUs / 10g), leaving
+# headroom for the host. Delete both of these when moving to reference hardware.
+LOCAL_MAX_NANO_CPUS = int(6e9)   # 6 CPUs
+LOCAL_MAX_MEM_LIMIT = "8g"
+
+
 def build_container(
         test_spec: TestSpec,
         client: docker.DockerClient,
@@ -542,6 +549,16 @@ def build_container(
         if is_large:
             nano_cpus = 5 * nano_cpus
         mem_limit = config.get("mem_limit", "16g")
+
+        # TEMPORARY local clamp. The benchmark's reference envelope (up to 10
+        # CPUs and 32g) exceeds this machine's Docker allocation of 8 CPUs /
+        # 10g, and the Docker API rejects the request outright. This narrows
+        # the envelope so the pipeline runs locally; it also changes the
+        # conditions the tests are timed under, so any measurement taken with
+        # this clamp in place is for plumbing validation, NOT for reporting.
+        # Remove before running on the reference Linux x86 hardware.
+        nano_cpus = min(nano_cpus, LOCAL_MAX_NANO_CPUS)
+        mem_limit = LOCAL_MAX_MEM_LIMIT
 
         # Create the container
         logger.info(f"Creating container for {test_spec.instance_id}...")

@@ -576,11 +576,20 @@ def make_test_spec(instance: SWEPerfInstance, is_eval = False) -> TestSpec:
     eval_script_list_function = make_eval_script_list_function(
         instance, specs, env_name, repo_directory, base_commit, test_patch
     )
-    if platform.machine() in {"aarch64", "arm64"}:
-        # use arm64 unless explicitly specified
-        arch = "arm64" if instance_id not in USE_X86 else "x86_64"
-    else:
-        arch = "x86_64"
+    # TEMPORARY local override. run_evaluation.py hardcodes the published
+    # image name as `sweb.eval.x86_64.<instance_id>` under
+    # docker.io/betty1202/, and no arm64 variant of those images exists.
+    # Selecting arm64 here on Apple Silicon makes Docker request a platform
+    # the published image cannot provide, which fails as a 404 at container
+    # creation. Forcing x86_64 makes the requested platform match the image;
+    # it then runs under emulation, so timings taken this way are for
+    # plumbing validation only, NOT for reporting.
+    # Restore the original selection below on reference Linux x86 hardware.
+    arch = "x86_64"
+    # if platform.machine() in {"aarch64", "arm64"}:
+    #     arch = "arm64" if instance_id not in USE_X86 else "x86_64"
+    # else:
+    #     arch = "x86_64"
 
     return TestSpec(
         instance_id=instance_id,
