@@ -32,6 +32,76 @@ from tqdm import tqdm
 DIFF_MODIFIED_FILE_REGEX = r"--- a/(.*)"
 REPEAT_TIME = 20 # TODO
 
+# ---------------------------------------------------------------------------
+# Per-test memory instrumentation
+# ---------------------------------------------------------------------------
+# Written into the container beside the repo and loaded with `-p`. It hooks
+# pytest-json-report (already installed by the eval script) so memory lands in
+# the same report*.json files as `duration`, letting check_evaluation read both
+# from one place.
+#
+# Deliberately syscall-only: two /proc reads and a getrusage per test. Anything
+# heavier -- tracemalloc especially, which can double runtime -- would corrupt
+# the timing measurement this benchmark exists to produce.
+MEM_PLUGIN_MODULE = "sweperf_memplugin"
+MEM_PLUGIN_HEREDOC = "EOF_SWEPERF_MEMPLUGIN"
+MEM_PLUGIN_SOURCE = r'''
+import resource
+
+
+def _vm_rss_kb():
+    """Current resident set size in kB, or None if /proc is unavailable."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _max_rss_kb():
+    """Peak RSS watermark for this process, in kB on Linux."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+
+
+def pytest_json_runtest_metadata(item, call):
+    """Attach memory readings to this test's entry in the JSON report.
+
+    ru_maxrss is a high-water mark that never decreases, so maxrss_growth_kb is
+    how much the process peak grew during this test -- a lower bound on the
+    test's own peak, not an absolute figure. It is still directly comparable
+    between the base and patched runs of the SAME test, which is what this
+    benchmark measures. rss_before/after are true current usage.
+    """
+    if call.when == "setup":
+        item._sweperf_rss_before = _vm_rss_kb()
+        item._sweperf_maxrss_before = _max_rss_kb()
+        return {}
+
+    if call.when != "call":
+        return {}
+
+    rss_before = getattr(item, "_sweperf_rss_before", None)
+    maxrss_before = getattr(item, "_sweperf_maxrss_before", None)
+    rss_after = _vm_rss_kb()
+    maxrss_after = _max_rss_kb()
+
+    meta = {
+        "rss_before_kb": rss_before,
+        "rss_after_kb": rss_after,
+        "maxrss_before_kb": maxrss_before,
+        "maxrss_after_kb": maxrss_after,
+    }
+    if rss_before is not None and rss_after is not None:
+        meta["rss_growth_kb"] = rss_after - rss_before
+    if maxrss_before is not None:
+        meta["maxrss_growth_kb"] = maxrss_after - maxrss_before
+    return meta
+'''
+
+
 @dataclass
 class TestSpec:
     """
@@ -302,20 +372,20 @@ def make_test_command(instance):
     joined_tests = "\' \'".join(instance['efficiency_test'])
     # warm up the cache
     commands.append(
-                    MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv --json-report --json-report-file=report.json " + f"\'{joined_tests}\'"
+                    MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv -p {MEM_PLUGIN_MODULE} --json-report --json-report-file=report.json " + f"\'{joined_tests}\'"
     )
     commands.append(
-                    MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv --json-report --json-report-file=report.json " + f"\'{joined_tests}\'"
+                    MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv -p {MEM_PLUGIN_MODULE} --json-report --json-report-file=report.json " + f"\'{joined_tests}\'"
     )
     commands.append(
-                    MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv --json-report --json-report-file=report.json " + f"\'{joined_tests}\'"
+                    MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv -p {MEM_PLUGIN_MODULE} --json-report --json-report-file=report.json " + f"\'{joined_tests}\'"
     )
     # for idx, test in enumerate(instance["efficiency_test"]):
     #     command = MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv --json-report --json-report-file=report{idx}.json " + f"\'{test}\'"
     #     commands.append(command)
     for re_idx in range(REPEAT_TIME):
         commands.append(
-            MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv --json-report --json-report-file=report{re_idx}.json " + f"\'{joined_tests}\'"
+            MAP_REPO_VERSION_TO_SPECS[instance["repo"].lower()][instance["version"]]["test_all_cmd"] + f" -vv -p {MEM_PLUGIN_MODULE} --json-report --json-report-file=report{re_idx}.json " + f"\'{joined_tests}\'"
         )
     return commands
 
@@ -352,9 +422,18 @@ def make_eval_script_list(instance, specs, env_name, repo_directory, base_commit
     if "install" in specs:
         eval_commands.append(specs["install"])
     eval_commands += [
-        reset_tests_command, "pip install pytest-json-report"] + \
+        reset_tests_command,
+        "pip install pytest-json-report",
+        # Memory instrumentation: drop the plugin beside the repo and put that
+        # directory on PYTHONPATH so `-p` can import it. Written per run rather
+        # than baked into the image, so it stays visible in the logged eval.sh.
+        f"cat > {repo_directory}/{MEM_PLUGIN_MODULE}.py <<'{MEM_PLUGIN_HEREDOC}'\n"
+        f"{MEM_PLUGIN_SOURCE}\n{MEM_PLUGIN_HEREDOC}",
+        f"export PYTHONPATH={repo_directory}:$PYTHONPATH",
+    ] + \
         test_command + \
-        [reset_tests_command]  # Revert tests after done, leave the repo in the same state as before
+        [reset_tests_command,  # Revert tests after done, leave the repo as before
+         f"rm -f {repo_directory}/{MEM_PLUGIN_MODULE}.py"]
     return eval_commands
 
 def make_test_command_alltests(instance):
