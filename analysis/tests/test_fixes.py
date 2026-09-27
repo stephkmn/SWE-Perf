@@ -310,3 +310,68 @@ class TestBodyRanges:
     def test_syntax_error_yields_nothing(self):
         from patch_scope import function_body_ranges
         assert function_body_ranges("def broken(:") == []
+
+
+# --- Fix 5: the patch reaches the container, and "applied" means applied -----
+
+class TestPatchDelivery:
+    """The tar member has to be named for the destination, not the source.
+
+    docker_utils.copy_to_container names it after the source file, so the
+    archive unpacks beside the requested path under a different name and the
+    path the apply command reads never exists.
+    """
+
+    def test_tar_member_is_named_for_the_destination(self, tmp_path):
+        import io
+        import tarfile
+
+        from timed_path import copy_file_to_container
+
+        src = tmp_path / "sympy__sympy-26358.patch"
+        src.write_text("diff --git a/x.py b/x.py\n")
+        sent = {}
+
+        class FakeContainer:
+            def exec_run(self, cmd):
+                sent["mkdir"] = cmd
+
+            def put_archive(self, path, data):
+                sent["path"] = path
+                sent["names"] = tarfile.open(fileobj=io.BytesIO(data)).getnames()
+
+        copy_file_to_container(FakeContainer(), src, "/tmp/timed_path.diff")
+        assert sent["path"] == "/tmp"
+        assert sent["names"] == ["timed_path.diff"]
+
+
+class TestApplyVerification:
+    """`git diff --stat` alone answers the wrong question.
+
+    Several eval images ship /testbed already dirty from their install step's
+    sed, so the old check read as success no matter what the apply did.
+    """
+
+    def test_reads_modified_and_added_paths(self):
+        from timed_path import porcelain_paths
+
+        assert porcelain_paths(
+            " M sympy/integrals/heurisch.py\n?? new_file.py\nA  staged.py\n"
+        ) == {"sympy/integrals/heurisch.py", "new_file.py", "staged.py"}
+
+    def test_rename_keeps_the_new_name(self):
+        from timed_path import porcelain_paths
+
+        assert porcelain_paths('R  old.py -> new.py\n') == {"new.py"}
+
+    def test_blank_lines_are_ignored(self):
+        from timed_path import porcelain_paths
+
+        assert porcelain_paths("\n\n M a.py\n") == {"a.py"}
+
+    def test_dirty_baseline_does_not_look_like_an_applied_patch(self):
+        from timed_path import porcelain_paths
+
+        baseline = porcelain_paths(" M pyproject.toml\n")          # astropy images
+        patched = {"astropy/units/core.py"}
+        assert [p for p in patched if p not in baseline] == ["astropy/units/core.py"]

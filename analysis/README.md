@@ -107,6 +107,26 @@ before they were fixed:
   line, its decorators and its docstring all execute at import, so the full
   span answers "was this module imported", which is true of every function in a
   touched file.
+- The patch is copied to an explicitly named tar member. `docker_utils.
+  copy_to_container` names the member after the *source* file, so the archive
+  unpacks beside the requested path under a different name and the path the
+  apply command reads never exists -- every instance then failed to patch.
+- "Applied" is read from the apply command's exit status plus the diff's own
+  file list turning up as changed, not from `git diff --stat` printing
+  something. Several eval images ship `/testbed` already dirty from their
+  install step's `sed` (astropy's `pyproject.toml`, for one), so the old check
+  reported success no matter what the apply did -- and those instances were
+  then measured on unpatched code. `baseline_dirty` records that state, and
+  `apply_output`/`verify_output` keep the last 2000 characters of both commands
+  when the apply fails.
+- Coverage runs under a pinned rcfile rather than the repo's own config.
+  sphinx sets `parallel = true` in `pyproject.toml`, which writes
+  `.coverage.<host>.<pid>.<rand>`; `coverage json` then finds no data file and
+  the run reads as "coverage produced no report".
+- `pytest_exit_code` is recorded, and exit codes 2-5 (collection error, bad
+  usage, nothing collected) are an error rather than a report of zero coverage.
+  `files_not_measured` names any patched file coverage never saw, so "the file
+  was not measured" is never filed as "the function did not run".
 
 This exists to stop a wrong inference. Speeding up a helper that a target
 function calls is the intended solution in SWE-Perf's realistic setting, yet
