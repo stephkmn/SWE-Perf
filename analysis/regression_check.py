@@ -130,6 +130,36 @@ def outcomes_from_report(report):
     return {t["nodeid"]: t.get("outcome") for t in report["tests"]}
 
 
+def collection_errors(report):
+    """Node ids that failed to import or collect.
+
+    pytest-json-report records these under "collectors" with outcome "failed".
+    They matter because the benchmark's test command passes
+    --continue-on-collection-errors: a patch that breaks an import makes whole
+    modules silently disappear from the run instead of failing it.
+    """
+    if not report:
+        return []
+    errors = []
+    for collector in report.get("collectors", []) or []:
+        if collector.get("outcome") == "failed":
+            errors.append(collector.get("nodeid") or "<unknown>")
+    return sorted(set(errors))
+
+
+def summarise_run(report):
+    """Counts for one pytest run, so a vanished test cannot look like a pass."""
+    outcomes = outcomes_from_report(report)
+    tally = {"collected": len(outcomes), "passed": 0, "failed": 0,
+             "error": 0, "skipped": 0, "other": 0}
+    for outcome in outcomes.values():
+        key = outcome if outcome in ("passed", "failed", "error", "skipped") else "other"
+        tally[key] += 1
+    errors = collection_errors(report)
+    tally["collection_errors"] = len(errors)
+    return tally, outcomes, errors
+
+
 def check_instance(instance, prediction, client, args):
     """Run the selected tests before and after the patch for one instance."""
     iid = instance["instance_id"]
@@ -141,9 +171,15 @@ def check_instance(instance, prediction, client, args):
         "test_scope": args.test_scope,
         "tests_selected": [],
         "n_tests_run_base": 0,
+        "base_counts": {},
+        "after_counts": {},
+        "base_collection_errors": [],
+        "after_collection_errors": [],
+        "new_collection_errors": [],
         "pass_to_fail": [],
         "missing_after_patch": [],
         "flaky": [],
+        "regression_count": 0,
         "timed_out": False,
         "error": None,
     }
@@ -181,7 +217,10 @@ def check_instance(instance, prediction, client, args):
         if timed_out:
             result["timed_out"] = True
             return result
-        base_outcomes = outcomes_from_report(read_container_file(container, "/tmp/reg_base.json"))
+        base_counts, base_outcomes, base_errors = summarise_run(
+            read_container_file(container, "/tmp/reg_base.json"))
+        result["base_counts"] = base_counts
+        result["base_collection_errors"] = base_errors
         result["n_tests_run_base"] = len(base_outcomes)
         if not base_outcomes:
             result["error"] = "no tests collected on base"
@@ -208,10 +247,17 @@ def check_instance(instance, prediction, client, args):
         if timed_out:
             result["timed_out"] = True
             return result
-        after_outcomes = outcomes_from_report(read_container_file(container, "/tmp/reg_after.json"))
+        after_counts, after_outcomes, after_errors = summarise_run(
+            read_container_file(container, "/tmp/reg_after.json"))
+        result["after_counts"] = after_counts
+        result["after_collection_errors"] = after_errors
+        result["new_collection_errors"] = sorted(set(after_errors) - set(base_errors))
 
         passed_on_base = {n for n, o in base_outcomes.items() if o == "passed"}
         broke = sorted(n for n in passed_on_base if after_outcomes.get(n) in FAILING_OUTCOMES)
+        # A test that ran on base and did not run at all afterwards is a
+        # regression, not a pass: --continue-on-collection-errors lets a broken
+        # import remove whole modules from the run without failing anything.
         result["missing_after_patch"] = sorted(n for n in passed_on_base if n not in after_outcomes)
 
         # A single rerun separates a real regression from an order- or
@@ -228,6 +274,9 @@ def check_instance(instance, prediction, client, args):
                 result["flaky"] = sorted(n for n in broke if rerun.get(n) == "passed")
                 broke = [n for n in broke if n not in set(result["flaky"])]
         result["pass_to_fail"] = broke
+        result["regression_count"] = (
+            len(broke) + len(result["missing_after_patch"]) + len(result["new_collection_errors"])
+        )
 
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -275,10 +324,17 @@ def main():
         result["duration_s"] = round(time.time() - started, 1)
         write_json(out_dir / f"{result['instance_id']}.json", result)
         status = (result["error"] or ("timed out" if result["timed_out"] else
-                  f"{len(result['pass_to_fail'])} regression(s)"))
+                  f"{result['regression_count']} regression(s)"))
+        detail = []
+        if result["missing_after_patch"]:
+            detail.append(f"{len(result['missing_after_patch'])} vanished")
+        if result["new_collection_errors"]:
+            detail.append(f"{len(result['new_collection_errors'])} new collection error(s)")
+        if result["flaky"]:
+            detail.append(f"{len(result['flaky'])} flaky")
         print(f"[{n}/{len(preds)}] {result['instance_id']}: {status}, "
               f"{result['n_tests_run_base']} test(s), {result['duration_s']}s"
-              + (f", {len(result['flaky'])} flaky" if result["flaky"] else ""))
+              + (", " + ", ".join(detail) if detail else ""))
 
     print(f"\nresults: {out_dir}")
 

@@ -29,7 +29,8 @@ SECTION_NAME_RE = re.compile(r"\b(?:def|class)\s+(\w+)")
 def parse_diff(diff_text):
     """Split a unified diff into per-file changed-line information.
 
-    Returns {path: {"old_lines": set[int], "added": [(new_lineno, text)],
+    Returns {path: {"old_lines": set[int],
+                    "added": [(new_lineno, text, base_anchor)],
                     "sections": [str]}}.
 
     `old_lines` holds base-file line numbers, which is what the AST of the base
@@ -58,7 +59,7 @@ def parse_diff(diff_text):
                     entry["old_lines"].add(line.source_line_no)
                 elif line.is_added:
                     entry["old_lines"].add(anchor)
-                    entry["added"].append((line.target_line_no, line.value.rstrip("\n")))
+                    entry["added"].append((line.target_line_no, line.value.rstrip("\n"), anchor))
     return files
 
 
@@ -81,6 +82,43 @@ def function_ranges(source):
                 name = prefix + child.name
                 starts = [child.lineno] + [d.lineno for d in getattr(child, "decorator_list", [])]
                 ranges.append((name, min(starts), getattr(child, "end_lineno", child.lineno)))
+                walk(child, name + ".")
+            else:
+                walk(child, prefix)
+
+    walk(tree, "")
+    return ranges
+
+
+def function_body_ranges(source):
+    """(qualified_name, first_body_line, end_line) for every def and class.
+
+    Distinct from function_ranges: a `def` line, its decorators and its
+    docstring all execute when the module is imported, so asking "did any line
+    of this function run" against the full span answers "was it imported",
+    which is true of every function in a touched module. Only the executable
+    body separates a function that actually ran from one that was merely
+    defined.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+
+    ranges = []
+
+    def body_start(node):
+        body = [st for st in node.body if not (
+            isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)
+            and isinstance(st.value.value, str))]
+        return (body[0].lineno if body else getattr(node, "end_lineno", node.lineno))
+
+    def walk(node, prefix):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = prefix + child.name
+                ranges.append((name, body_start(child),
+                               getattr(child, "end_lineno", child.lineno)))
                 walk(child, name + ".")
             else:
                 walk(child, prefix)
@@ -119,38 +157,109 @@ def functions_from_sections(sections):
     return names
 
 
+DEF_RE = re.compile(r"^\s*(?:async\s+)?def\s+(\w+)")
+CLASS_RE = re.compile(r"^\s*class\s+(\w+)")
+DECORATOR_RE = re.compile(r"^\s*@")
+
+
+def added_definitions(added):
+    """Functions and classes the patch introduces.
+
+    A brand-new definition cannot be found by mapping lines onto the base
+    AST -- it does not exist there -- so without this a patch that adds a
+    helper looks like an untargeted module-level edit.
+    """
+    names = set()
+    for _, text, _ in added:
+        body = text.lstrip("+")
+        match = DEF_RE.match(body) or CLASS_RE.match(body)
+        if match:
+            names.add(match.group(1))
+    return names
+
+
+def decorated_functions(ranges, added):
+    """Existing functions that the patch decorates.
+
+    A decorator inserted above an existing `def` anchors to the blank line
+    before it, so line mapping calls it a module-level edit even though it
+    changes that function's behaviour -- which is how SWE-Perf's own
+    patch_functions labels it.
+    """
+    starts = {}
+    for name, start, _ in ranges:
+        starts.setdefault(start, name)
+    names = set()
+    for _, text, anchor in added:
+        if DECORATOR_RE.match(text.lstrip("+")) and anchor is not None:
+            following = starts.get(anchor + 1)
+            if following:
+                names.add(following)
+    return names
+
+
 def _tail(name):
     """"pkg/f.py::A.b.c" -> ("pkg/f.py", "c")."""
     path, _, qual = name.partition("::")
     return path, qual.rsplit(".", 1)[-1]
 
 
-def match_functions(changed, reference):
-    """Match changed functions against a reference set, tolerating the dataset's
-    inconsistent qualification.
+def short_name_counts(ranges):
+    """How many defs/classes in one file share each final name component.
+
+    Files routinely contain several `wrapper`s or `__init__`s, so a fallback
+    match on the short name can attach a change to the wrong function. Counting
+    them lets each match say whether it was ambiguous.
+    """
+    counts = {}
+    for name, _, _ in ranges:
+        tail = name.rsplit(".", 1)[-1]
+        counts[tail] = counts.get(tail, 0) + 1
+    return counts
+
+
+def match_functions(changed, reference, ambiguity=None):
+    """Match changed functions against a reference set, labelling each match.
 
     The dataset writes some names fully qualified ("LombScargle.autopower") and
     others bare ("wrapper", which the AST resolves as
-    "QuantityInput.__call__.wrapper"). Exact matching alone therefore misses
-    real overlaps and would overstate how much novel ground a patch covered.
-    Falling back to the final name component is scoped to the same file, so the
-    residual risk is two same-named functions in one module.
+    "QuantityInput.__call__.wrapper"), so exact matching alone misses real
+    overlaps and overstates how much novel ground a patch covered. The fallback
+    compares the final name component within the same file.
 
-    Returns (matched_reference_entries, unmatched_changed_entries).
+    `ambiguity` maps a file path to {short_name: count} from short_name_counts;
+    a fallback match on a name appearing more than once in that file is marked
+    ambiguous rather than silently trusted.
+
+    Returns (matches, unmatched_changed) where each match is
+    {reference, changed, match_type, ambiguous}.
     """
+    ambiguity = ambiguity or {}
     by_tail = {}
     for ref in reference:
         by_tail.setdefault(_tail(ref), set()).add(ref)
 
-    matched, unmatched = set(), []
-    for name in changed:
+    matches, unmatched = [], []
+    for name in sorted(changed):
         if name in reference:
-            matched.add(name)
-        elif _tail(name) in by_tail:
-            matched |= by_tail[_tail(name)]
-        else:
-            unmatched.append(name)
-    return matched, unmatched
+            matches.append({"reference": name, "changed": name,
+                            "match_type": "exact", "ambiguous": False})
+            continue
+        key = _tail(name)
+        if key in by_tail:
+            path, short = key
+            ambiguous = ambiguity.get(path, {}).get(short, 0) > 1
+            for ref in sorted(by_tail[key]):
+                matches.append({"reference": ref, "changed": name,
+                                "match_type": "fallback", "ambiguous": ambiguous})
+            continue
+        unmatched.append(name)
+    return matches, unmatched
+
+
+def _refs(matches, match_type=None):
+    return sorted({m["reference"] for m in matches
+                   if match_type is None or m["match_type"] == match_type})
 
 
 def analyze_patch(instance, patch_text, mirror_dir=None):
@@ -161,21 +270,26 @@ def analyze_patch(instance, patch_text, mirror_dir=None):
 
     mirrors = Path(mirror_dir) if mirror_dir else DEFAULT_MIRROR_DIR
     changed, module_level, used_ast = set(), 0, False
+    new_functions = set()
+    ambiguity = {}
     for path, info in per_file.items():
         source = base_source(instance["repo"], instance["base_commit"], path, mirrors)
         if source:
             used_ast = True
-            names, mod = functions_for_lines(function_ranges(source), info["old_lines"])
+            ranges = function_ranges(source)
+            names, mod = functions_for_lines(ranges, info["old_lines"])
+            names |= decorated_functions(ranges, info["added"])
             module_level += mod
+            ambiguity[path] = short_name_counts(ranges)
         else:
             names = functions_from_sections(info["sections"])
-        changed |= {f"{path}::{n}" for n in names}
+        introduced = added_definitions(info["added"])
+        new_functions |= {f"{path}::{n}" for n in introduced}
+        changed |= {f"{path}::{n}" for n in names | introduced}
 
     target_set, expert_set = flatten_functions(targets), flatten_functions(expert)
-    matched_targets, outside_targets = match_functions(changed, target_set)
-    matched_expert, _ = match_functions(changed, expert_set)
-    overlap_targets = sorted(matched_targets)
-    overlap_expert = sorted(matched_expert)
+    target_matches, outside_targets = match_functions(changed, target_set, ambiguity)
+    expert_matches, _ = match_functions(changed, expert_set, ambiguity)
 
     return {
         "instance_id": instance["instance_id"],
@@ -185,8 +299,14 @@ def analyze_patch(instance, patch_text, mirror_dir=None):
         "module_level_changes": module_level,
         "target_functions": sorted(target_set),
         "expert_functions": sorted(expert_set),
-        "overlap_with_targets": overlap_targets,
-        "overlap_with_expert": overlap_expert,
+        "overlap_with_targets": _refs(target_matches),
+        "overlap_with_targets_exact": _refs(target_matches, "exact"),
+        "overlap_with_expert": _refs(expert_matches),
+        "overlap_with_expert_exact": _refs(expert_matches, "exact"),
+        "target_matches": target_matches,
+        "expert_matches": expert_matches,
+        "n_ambiguous_matches": sum(1 for m in target_matches if m["ambiguous"]),
+        "new_functions": sorted(new_functions),
         "functions_outside_targets": sorted(outside_targets),
         # True only when the patch changed something and stayed entirely inside
         # the named targets -- the shape most worth reviewing by hand.

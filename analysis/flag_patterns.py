@@ -53,7 +53,7 @@ def scan_patch(patch_text):
     """Return one flag per matching added line."""
     flags = []
     for path, info in parse_diff(patch_text).items():
-        for lineno, text in info["added"]:
+        for lineno, text, _ in info["added"]:
             stripped = text.lstrip("+")
             # Comments and docstring prose trip the keyword patterns constantly.
             if stripped.strip().startswith("#"):

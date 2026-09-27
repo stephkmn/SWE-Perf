@@ -60,12 +60,14 @@ def build_rows(args):
     scope = {r["instance_id"]: r for r in read_jsonl(args.patch_scope)}
     flags = {r["instance_id"]: r for r in read_jsonl(args.flags)}
     regression = {r["instance_id"]: r for r in read_regression_dir(args.regression_dir)}
+    timed = {r["instance_id"]: r for r in read_regression_dir(args.timed_path_dir)}
     official = official_by_repo(args.official_csv)
 
-    ids = sorted(set(scope) | set(flags) | set(regression))
+    ids = sorted(set(scope) | set(flags) | set(regression) | set(timed))
     rows = []
     for iid in ids:
         s, f, g = scope.get(iid, {}), flags.get(iid, {}), regression.get(iid, {})
+        t = timed.get(iid, {})
         repo = s.get("repo") or g.get("repo") or instances.get(iid, {}).get("repo")
         row = {
             "instance_id": iid,
@@ -75,7 +77,10 @@ def build_rows(args):
             "n_files_changed": len(s.get("files_changed", [])),
             "n_functions_changed": s.get("n_functions_changed"),
             "overlap_with_targets": len(s.get("overlap_with_targets", [])),
+            "overlap_with_targets_exact": len(s.get("overlap_with_targets_exact", [])),
             "overlap_with_expert": len(s.get("overlap_with_expert", [])),
+            "overlap_with_expert_exact": len(s.get("overlap_with_expert_exact", [])),
+            "n_ambiguous_matches": s.get("n_ambiguous_matches"),
             "touches_only_targets": s.get("touches_only_targets"),
             "functions_changed": "; ".join(s.get("functions_changed", [])),
             # flags
@@ -84,16 +89,31 @@ def build_rows(args):
             # regression
             "regression_scope": g.get("test_scope"),
             "n_tests_run_base": g.get("n_tests_run_base"),
+            "n_regressions": g.get("regression_count") if g else None,
             "n_pass_to_fail": len(g.get("pass_to_fail", [])) if g else None,
             "pass_to_fail": "; ".join(g.get("pass_to_fail", [])),
+            "n_missing_after_patch": len(g.get("missing_after_patch", [])) if g else None,
+            "n_new_collection_errors": len(g.get("new_collection_errors", [])) if g else None,
             "n_flaky": len(g.get("flaky", [])) if g else None,
             "regression_timed_out": g.get("timed_out"),
             "regression_error": g.get("error"),
+            # coverage of the timed tests
+            "n_on_timed_path": t.get("n_on_path"),
+            "n_off_timed_path": t.get("n_off_path"),
+            "off_timed_path_functions": "; ".join(t.get("off_path_functions", [])),
+            "timed_path_error": t.get("error"),
         }
+        for side in ("base", "after"):
+            for key, value in (g.get(f"{side}_counts") or {}).items():
+                row[f"{side}_{key}"] = value
         row.update(official.get(repo, {}))
         # Anything a human should look at first.
+        # Off-timed-path changes join the review set: those are the only
+        # candidates for a genuinely different bottleneck, and also the place
+        # dead work would hide.
         row["needs_review"] = bool(
-            row["n_flags"] or (row["n_pass_to_fail"] or 0) or row["touches_only_targets"]
+            row["n_flags"] or (row["n_regressions"] or 0) or row["touches_only_targets"]
+            or (row["n_off_timed_path"] or 0) or (row["n_ambiguous_matches"] or 0)
         )
         rows.append(row)
     return pd.DataFrame(rows)
@@ -104,6 +124,7 @@ def main():
     p.add_argument("--patch_scope", default="analysis_out/patch_scope.jsonl")
     p.add_argument("--flags", default="analysis_out/flags.jsonl")
     p.add_argument("--regression_dir", default="analysis_out/regression")
+    p.add_argument("--timed_path_dir", default="analysis_out/timed_path")
     p.add_argument("--official_csv", default=None,
                    help="check_evaluation output; joined per repo, not per instance")
     p.add_argument("--output", default="analysis_out/combined_report.csv")
@@ -136,8 +157,10 @@ def main():
     review["category"] = ""
     review["notes"] = ""
     columns = ["instance_id", "repo", "review_reason", "n_flags", "flag_categories",
-               "n_pass_to_fail", "touches_only_targets", "n_functions_changed",
-               "functions_changed", "category", "notes"]
+               "n_regressions", "n_pass_to_fail", "n_missing_after_patch",
+               "n_new_collection_errors", "touches_only_targets", "n_ambiguous_matches",
+               "n_on_timed_path", "n_off_timed_path", "off_timed_path_functions",
+               "n_functions_changed", "functions_changed", "category", "notes"]
     review[[c for c in columns if c in review.columns]].to_csv(args.review_output, index=False)
 
     print(f"combined report : {out}  ({len(frame)} instance(s))")

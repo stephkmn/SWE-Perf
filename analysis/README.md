@@ -85,11 +85,78 @@ or environment inspection, and monkey-patching of library attributes. Every
 pattern is legitimate somewhere — a flag means "read this one", not "this is
 cheating".
 
-### 4. Combined report
+### 4. Timed-path coverage (needs Docker)
+
+```bash
+python timed_path.py --predictions ../datasets/outputs/preds.jsonl
+```
+
+Applies the patch and runs the instance's `efficiency_test` list **once** under
+`coverage.py` — no timing, so it cannot disturb official measurements. Records
+`on_timed_path` per changed function, plus `n_files_measured` and the tail of
+the pytest output so a failed run is visible rather than silently reported as
+"nothing ran".
+
+Two measurement details matter here, both of which produced wrong answers
+before they were fixed:
+
+- Coverage is run with `--source` pinned to the checkout. Without it the first
+  run reported every changed function as off-path, including functions the
+  timed tests demonstrably exercise.
+- "Did it run" is asked of the function's **body**, not its full span. A `def`
+  line, its decorators and its docstring all execute at import, so the full
+  span answers "was this module imported", which is true of every function in a
+  touched file.
+
+This exists to stop a wrong inference. Speeding up a helper that a target
+function calls is the intended solution in SWE-Perf's realistic setting, yet
+that helper appears "outside the named targets". Only a changed function that
+never executes during the timed tests is a candidate for a genuinely different
+bottleneck — or for dead work that cannot be affecting the score at all.
+
+### 5. Provenance audit (no Docker)
+
+```bash
+python provenance_audit.py --predictions ../datasets/outputs/preds.jsonl
+```
+
+Before commit `19d54d4`, the generation driver cloned the full mirror into each
+working copy, so the agent could read forward through history to the upstream
+fix. This dates each prediction against that commit using the provenance file's
+`started_at` and prompt hash, and searches transcripts for `git log`, `--all`,
+`git show`, `git tag`.
+
+**Read `transcript_fidelity` before trusting the transcript search.** Full
+stream-json transcripts only began in the same commit that fixed the problem,
+so pre-fix transcripts hold the agent's closing prose and nothing else —
+finding no `git log` in them proves nothing, because a tool call could never
+have appeared there.
+
+### 6. Combined report
 
 ```bash
 python report.py --official_csv ../datasets/outputs/model_result.csv --sample_size 20
 ```
+
+Beyond the scope and flag columns, the report carries per-run test accounting
+(`base_collected`/`after_collected`, passed/failed/errored/skipped,
+`collection_errors`) and three regression components:
+
+| Column | Meaning |
+|---|---|
+| `n_pass_to_fail` | passed on base, failed after |
+| `n_missing_after_patch` | ran on base, did not run at all after |
+| `n_new_collection_errors` | modules that stopped importing |
+| `n_regressions` | the sum of those three |
+
+The last two matter because the benchmark's test command passes
+`--continue-on-collection-errors`: a patch that breaks an import makes whole
+modules vanish rather than fail, which would otherwise read as a clean pass.
+
+Overlap is reported twice — `overlap_with_targets_exact` counts only exact
+name matches, `overlap_with_targets` also counts short-name fallbacks, and
+`n_ambiguous_matches` counts fallbacks onto a short name that appears more than
+once in its file.
 
 Merges everything into `combined_report.csv`, plus `manual_review.csv`
 containing every flagged or regressing patch and a fixed-seed random sample of
@@ -111,5 +178,7 @@ patch.
 python -m pytest tests/test_analysis.py -q
 ```
 
-43 tests covering the diff parser, AST function mapping, name matching, and
-pattern flags. No Docker, network, or dataset required.
+85 tests across `test_analysis.py` and `test_fixes.py`, covering the diff
+parser, AST function mapping, match labelling, run accounting, coverage path
+mapping, pattern flags, and provenance dating. No Docker, network, or dataset
+required.

@@ -78,7 +78,7 @@ class TestDiffParser:
     def test_collects_file_and_added_lines(self):
         parsed = parse_diff(DIFF_MODIFY_FUNCTION)
         assert list(parsed) == ["pkg/mod.py"]
-        added = [t for _, t in parsed["pkg/mod.py"]["added"]]
+        added = [t for _, t, _ in parsed["pkg/mod.py"]["added"]]
         assert any("n * (n - 1)" in t for t in added)
 
     def test_records_base_line_numbers(self):
@@ -230,26 +230,34 @@ class TestFunctionMapParsing:
 
 
 class TestFunctionMatching:
-    """The dataset qualifies some names and not others; matching must cope."""
+    """The dataset qualifies some names and not others; matching must cope.
+
+    match_functions returns (matches, unmatched) where each match records how
+    it was made -- see tests/test_fixes.py for the labelling itself.
+    """
+
+    @staticmethod
+    def refs(matches):
+        return sorted({m["reference"] for m in matches})
 
     def test_exact_match(self):
-        matched, unmatched = match_functions({"a.py::f"}, {"a.py::f"})
-        assert matched == {"a.py::f"} and unmatched == []
+        matches, unmatched = match_functions({"a.py::f"}, {"a.py::f"})
+        assert self.refs(matches) == ["a.py::f"] and unmatched == []
 
     def test_bare_reference_matches_qualified_change(self):
         # dataset says "wrapper"; the AST resolves "QuantityInput.__call__.wrapper"
-        matched, unmatched = match_functions(
+        matches, unmatched = match_functions(
             {"d.py::QuantityInput.__call__.wrapper"}, {"d.py::wrapper"})
-        assert matched == {"d.py::wrapper"} and unmatched == []
+        assert self.refs(matches) == ["d.py::wrapper"] and unmatched == []
 
     def test_tail_match_does_not_cross_files(self):
-        matched, unmatched = match_functions({"a.py::C.wrapper"}, {"b.py::wrapper"})
-        assert matched == set() and unmatched == ["a.py::C.wrapper"]
+        matches, unmatched = match_functions({"a.py::C.wrapper"}, {"b.py::wrapper"})
+        assert matches == [] and unmatched == ["a.py::C.wrapper"]
 
     def test_reports_unmatched_changes(self):
-        matched, unmatched = match_functions({"a.py::f", "a.py::g"}, {"a.py::f"})
-        assert matched == {"a.py::f"} and unmatched == ["a.py::g"]
+        matches, unmatched = match_functions({"a.py::f", "a.py::g"}, {"a.py::f"})
+        assert self.refs(matches) == ["a.py::f"] and unmatched == ["a.py::g"]
 
     def test_empty_inputs(self):
-        assert match_functions(set(), {"a.py::f"}) == (set(), [])
-        assert match_functions({"a.py::f"}, set()) == (set(), ["a.py::f"])
+        assert match_functions(set(), {"a.py::f"}) == ([], [])
+        assert match_functions({"a.py::f"}, set()) == ([], ["a.py::f"])
