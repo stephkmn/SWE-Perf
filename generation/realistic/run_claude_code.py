@@ -147,9 +147,19 @@ USAGE_LIMIT_RE = re.compile(
 # rather than a slow one.
 KEEP_STATUSES = ("ok", "empty_patch")
 
+# Statuses where the agent was cut off mid-thought rather than finishing. The
+# diff it left behind is a genuine partial attempt -- worth reading, and worth
+# keeping so a run is not simply lost -- but it is not a result, so it goes to
+# its own file and never reaches the predictions the evaluator scores.
+PARTIAL_STATUSES = ("timeout", "max_turns")
+
 
 def earns_a_prediction(status: str) -> bool:
     return status in KEEP_STATUSES
+
+
+def earns_a_partial_prediction(status: str) -> bool:
+    return status in PARTIAL_STATUSES
 
 
 # Matched against the agent's own error text, never against the whole result
@@ -440,9 +450,12 @@ def _walk_tool_uses(node, out):
             _walk_tool_uses(value, out)
 
 
-def audit_transcript(stdout: str):
-    """Flag tool calls that look like network access or history spelunking."""
-    hits = []
+def stream_objects(stdout: str):
+    """Yield the JSON objects out of a stream-json transcript, skipping noise.
+
+    A killed run's transcript ends mid-line, and the CLI interleaves plain text
+    on the same stream, so anything unparseable is simply passed over.
+    """
     for line in stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -451,6 +464,47 @@ def audit_transcript(stdout: str):
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def count_assistant_turns(stdout: str) -> int:
+    """Assistant messages in the transcript.
+
+    This is the fallback count: when `timeout` kills the CLI there is no final
+    `result` line and therefore no `num_turns`, and the transcript is the only
+    surviving record of how far the agent actually got.
+    """
+    return sum(1 for obj in stream_objects(stdout) if obj.get("type") == "assistant")
+
+
+def count_tool_calls(stdout: str) -> int:
+    """Every tool_use block the agent emitted, over the whole transcript."""
+    total = 0
+    for obj in stream_objects(stdout):
+        uses = []
+        _walk_tool_uses(obj, uses)
+        total += len(uses)
+    return total
+
+
+def turn_count(result, stdout: str):
+    """(turns, source) -- the CLI's own count when the run reported one.
+
+    A run that was killed never printed a result line, so the number is counted
+    off the transcript instead and says so: the two are not measured the same
+    way and must not be compared as if they were.
+    """
+    turns = (result or {}).get("num_turns")
+    if isinstance(turns, int):
+        return turns, "result_line"
+    return count_assistant_turns(stdout), "transcript"
+
+
+def audit_transcript(stdout: str):
+    """Flag tool calls that look like network access or history spelunking."""
+    hits = []
+    for obj in stream_objects(stdout):
         uses = []
         _walk_tool_uses(obj, uses)
         for use in uses:
@@ -1233,6 +1287,8 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
         )
         if result is not None:
             meta["claude_result"] = result
+        meta["turns"], meta["turns_source"] = turn_count(result, stdout)
+        meta["tool_calls"] = count_tool_calls(stdout)
         suspects = audit_transcript(stdout)
         if suspects:
             meta["web_access_suspect"] = suspects
@@ -1247,6 +1303,13 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
             meta["status"] = "empty_patch"
         meta["patch_bytes"] = len(patch)
         meta["files_changed"] = patch.count("diff --git ")
+        if earns_a_partial_prediction(meta["status"]):
+            meta["partial_patch"] = bool(patch.strip())
+            meta["partial_patch_reason"] = (
+                f"cut off by {meta['status']}; the diff was filtered the normal "
+                f"way but is an unfinished attempt, so it is kept in the partial "
+                f"file and left out of the predictions"
+            )
     except Exception as exc:  # keep one bad instance from killing the sweep
         meta["status"] = "error"
         meta["error"] = redact(f"{type(exc).__name__}: {exc}", token)
@@ -1284,6 +1347,18 @@ def already_done(path: Path):
     return done
 
 
+def partial_stem(stem: str) -> str:
+    """Name the partial file after the predictions file it shadows.
+
+    `claude_code_pilot2_preds` -> `claude_code_pilot2_partial_preds`, so the
+    two sort together and it is obvious at a glance which is which.
+    """
+    suffix = "_preds"
+    if stem.endswith(suffix):
+        return stem[: -len(suffix)] + "_partial" + suffix
+    return stem + "_partial"
+
+
 def run_paths(out_path: Path, run_idx: int, num_runs: int):
     """One predictions file per run: run_evaluation.py keys predictions by
     instance_id, so duplicate ids in a single file silently overwrite."""
@@ -1293,7 +1368,18 @@ def run_paths(out_path: Path, run_idx: int, num_runs: int):
         preds = out_path.with_name(f"{out_path.stem}_run{run_idx}{out_path.suffix}")
     meta = preds.with_name(preds.stem + "_meta.jsonl")
     prov = preds.with_name(preds.stem + "_provenance.jsonl")
-    return preds, meta, prov
+    partial = preds.with_name(partial_stem(preds.stem) + preds.suffix)
+    return preds, meta, prov, partial
+
+
+def append_jsonl(path: Path, record: dict):
+    """Append one record, opening the file only when there is one to write.
+
+    Deliberately not held open for the sweep: a run with nothing partial should
+    not leave an empty file behind suggesting it had something.
+    """
+    with open(path, "a") as f:
+        f.write(json.dumps(record) + "\n")
 
 
 def load_instances(args):
@@ -1338,7 +1424,8 @@ def load_instances(args):
 def execute_run(run_idx, instances, args, out_path, log_root, client, token,
                 cli_cache, manifest):
     """Run one sweep, one container at a time. Returns (counts, hit_usage_limit)."""
-    preds_path, meta_path, prov_path = run_paths(out_path, run_idx, args.num_runs)
+    preds_path, meta_path, prov_path, partial_path = run_paths(
+        out_path, run_idx, args.num_runs)
     log_dir = log_root / f"run{run_idx}"
     log_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1402,21 +1489,38 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
             counts[status] = counts.get(status, 0) + 1
             # Anything that did not run cleanly gets a meta line but no
             # prediction, so a later --resume treats it as unfinished.
+            wrote_partial = False
             if earns_a_prediction(status) and record is not None:
                 out_f.write(json.dumps(record) + "\n"); out_f.flush()
+            elif meta.get("partial_patch") and record is not None:
+                # A cut-off run still produced a diff. It is kept out of the
+                # predictions file -- --resume must still see the instance as
+                # unfinished -- but it is not thrown away either.
+                append_jsonl(partial_path, record)
+                wrote_partial = True
             meta_f.write(json.dumps(meta) + "\n"); meta_f.flush()
 
             note = (f" (reverted {len(meta['reverted_tests'])} test file(s))"
                     if meta["reverted_tests"] else "")
+            if wrote_partial:
+                note += f" (partial patch -> {partial_path.name})"
             if meta.get("build_artifacts_filtered"):
                 note += f" ({len(meta['build_artifacts_filtered'])} build artifact(s) filtered)"
             if meta.get("web_access_suspect"):
                 note += f" (!! {len(meta['web_access_suspect'])} audit hit(s))"
             if meta.get("error"):
                 note += f" -- {meta['error'][:200]}"
+            # Turns are absent only on the setup paths, which return before
+            # Claude is ever started.
+            effort_note = ""
+            if meta.get("turns") is not None:
+                counted = (" counted from transcript"
+                           if meta.get("turns_source") == "transcript" else "")
+                effort_note = (f", {meta['turns']} turn(s){counted}, "
+                               f"{meta.get('tool_calls', 0)} tool call(s)")
             print(f"  [run {run_idx}] [{n}/{len(todo)}] {iid}: "
                   f"{status}, {meta.get('files_changed', 0)} file(s), "
-                  f"{meta['duration_s']}s{note}")
+                  f"{meta['duration_s']}s{effort_note}{note}")
 
             # A bad credential fails every instance identically, so there is
             # nothing to learn from spending a container on each of the rest.
@@ -1589,9 +1693,12 @@ def main():
     print("\nsummary across all runs: " +
           (", ".join(f"{k}={v}" for k, v in sorted(totals.items())) or "nothing run"))
     for run_idx in range(1, args.num_runs + 1):
-        preds, meta, _ = run_paths(out_path, run_idx, args.num_runs)
+        preds, meta, _, partial = run_paths(out_path, run_idx, args.num_runs)
         if preds.exists():
             print(f"  run {run_idx}: {preds}  (metadata: {meta.name})")
+        if partial.exists():
+            print(f"  run {run_idx}: partial patches from cut-off runs "
+                  f"(not predictions): {partial}")
     print(f"logs: {log_root}")
     if stopped == "auth_failed":
         print("\nSTOPPED: the Claude API rejected the credential (401/403). "

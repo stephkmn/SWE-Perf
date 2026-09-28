@@ -22,6 +22,8 @@ from run_claude_code import (
     parse_numstat_binaries, parse_porcelain_z, redact, remote_image_key,
     verify_cli_capabilities, verify_hidden_flags,
     classify_claude_failure, earns_a_prediction, parse_result_line,
+    KEEP_STATUSES, PARTIAL_STATUSES, count_assistant_turns, count_tool_calls,
+    earns_a_partial_prediction, partial_stem, run_paths, turn_count,
 )
 
 
@@ -534,3 +536,108 @@ class TestResultLineKeepsErrorFields:
         parsed = parse_result_line(line)
         assert parsed["api_error_status"] == 401
         assert parsed["terminal_reason"] == "api_error"
+
+
+def stream(*objs):
+    """A stream-json transcript: one JSON object per line."""
+    return "\n".join(json.dumps(o) for o in objs) + "\n"
+
+
+def assistant(*tool_names):
+    """An assistant message that calls the named tools."""
+    content = [{"type": "text", "text": "thinking"}]
+    content += [{"type": "tool_use", "name": n, "input": {"x": 1}} for n in tool_names]
+    return {"type": "assistant", "message": {"role": "assistant", "content": content}}
+
+
+class TestTurnCounting:
+    def test_the_result_line_is_believed_when_the_run_finished(self):
+        turns, source = turn_count({"num_turns": 87}, stream(assistant("Read")))
+        assert (turns, source) == (87, "result_line")
+
+    def test_zero_turns_from_the_result_line_is_still_the_result_line(self):
+        # `or` on the count would quietly fall through to the transcript here.
+        turns, source = turn_count({"num_turns": 0}, stream(assistant("Read")))
+        assert (turns, source) == (0, "result_line")
+
+    def test_a_killed_run_is_counted_off_the_transcript(self):
+        # No result line at all: `timeout` took the CLI down before it printed.
+        text = stream({"type": "system", "subtype": "init"},
+                      assistant("Read"),
+                      {"type": "user", "message": {"content": "tool result"}},
+                      assistant("Edit"))
+        turns, source = turn_count(None, text)
+        assert (turns, source) == (2, "transcript")
+
+    def test_a_result_line_without_num_turns_falls_back(self):
+        turns, source = turn_count({"is_error": True}, stream(assistant("Read")))
+        assert (turns, source) == (1, "transcript")
+
+    def test_a_truncated_last_line_does_not_break_the_count(self):
+        text = stream(assistant("Read"), assistant("Bash")) + '{"type": "assist'
+        assert count_assistant_turns(text) == 2
+
+    def test_plain_text_on_the_stream_is_ignored(self):
+        text = "Loading...\n" + stream(assistant("Read")) + "killed\n"
+        assert count_assistant_turns(text) == 1
+
+
+class TestToolCallCounting:
+    def test_every_tool_use_block_counts(self):
+        text = stream(assistant("Read", "Grep"), assistant(), assistant("Bash"))
+        assert count_tool_calls(text) == 3
+
+    def test_a_transcript_with_no_tools_counts_zero(self):
+        assert count_tool_calls(stream(assistant())) == 0
+
+    def test_an_empty_transcript_counts_zero(self):
+        assert count_tool_calls("") == 0
+        assert count_assistant_turns("") == 0
+
+
+class TestPartialPredictions:
+    @pytest.mark.parametrize("status", ["timeout", "max_turns"])
+    def test_a_cut_off_run_yields_a_partial(self, status):
+        assert earns_a_partial_prediction(status)
+
+    @pytest.mark.parametrize("status", [
+        "ok", "empty_patch", "auth_failed", "usage_limit", "api_error",
+        "error", "setup_failed", "claude_exit_1",
+    ])
+    def test_nothing_else_yields_a_partial(self, status):
+        assert not earns_a_partial_prediction(status)
+
+    def test_a_partial_is_never_also_a_prediction(self):
+        # The two files must not disagree about the same instance.
+        assert not set(KEEP_STATUSES) & set(PARTIAL_STATUSES)
+        for status in PARTIAL_STATUSES:
+            assert not earns_a_prediction(status)
+
+
+class TestPartialPath:
+    def test_partial_sits_beside_the_predictions_file(self, tmp_path):
+        out = tmp_path / "claude_code_pilot2_preds.jsonl"
+        preds, meta, prov, partial = run_paths(out, 1, 1)
+        assert preds == out
+        assert partial == tmp_path / "claude_code_pilot2_partial_preds.jsonl"
+        assert meta.name == "claude_code_pilot2_preds_meta.jsonl"
+        assert prov.name == "claude_code_pilot2_preds_provenance.jsonl"
+
+    def test_each_run_of_a_repeat_sweep_gets_its_own_partial(self, tmp_path):
+        out = tmp_path / "claude_code_preds.jsonl"
+        preds, _, _, partial = run_paths(out, 2, 3)
+        # The run suffix lands last, so the stem no longer ends in `_preds`
+        # and the marker is simply appended -- still unique per run.
+        assert preds.name == "claude_code_preds_run2.jsonl"
+        assert partial.name == "claude_code_preds_run2_partial.jsonl"
+
+    def test_a_name_that_does_not_end_in_preds_is_suffixed(self):
+        assert partial_stem("results") == "results_partial"
+
+    def test_only_the_trailing_preds_is_renamed(self):
+        assert partial_stem("preds_of_preds") == "preds_of_partial_preds"
+
+    def test_the_partial_path_is_never_the_predictions_path(self, tmp_path):
+        for name in ("a_preds.jsonl", "results.jsonl", "preds.jsonl"):
+            preds, _, _, partial = run_paths(tmp_path / name, 1, 1)
+            assert preds != partial

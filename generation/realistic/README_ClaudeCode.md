@@ -103,13 +103,21 @@ dropped path is recorded in the run's `_meta.jsonl`, with the reason.
 Beside `--output` (default `datasets/outputs/claude_code_preds.jsonl`):
 
 - `..._preds.jsonl` — `{instance_id, model_name_or_path, model_patch}`, ready for `evaluation/run_evaluation.py`
-- `..._meta.jsonl` — per instance: status, image, conda env, baseline report, filtered paths, prompt hash, CLI version, `claude_result`, web-access audit hits
+- `..._meta.jsonl` — per instance: status, image, conda env, baseline report, filtered paths, prompt hash, CLI version, `claude_result`, web-access audit hits, plus effort spent — `duration_s`, `turns`, `turns_source`, `tool_calls`
+- `..._partial_preds.jsonl` — same format as the predictions file, but only the diffs from runs cut off by `timeout` or `max_turns`. Never fed to the evaluator: a mid-edit tree is an unfinished attempt, not a result. Kept so a three-hour run is readable instead of lost.
 - `..._provenance.jsonl` — per run: `execution_env: "docker_with_deps"`, image names, model, effort, CLI/Node versions, tool allow/deny lists, prompt style and hashes
 - `claude_code_logs/run<N>/<id>.jsonl` — the full stream-json transcript
 - `claude_code_logs/run<N>/<id>.stderr.txt`
 
 Instances that error, time out, or hit a usage limit get a meta line but **no**
-prediction line, which is what makes `--resume` pick them up again.
+prediction line, which is what makes `--resume` pick them up again. A cut-off
+run's diff still lands in `..._partial_preds.jsonl`; that file is invisible to
+`--resume`, so the instance is retried regardless.
+
+`turns` comes from the CLI's own `num_turns` when the run printed a result
+line. A killed run never prints one, so the turns are counted off the saved
+transcript instead and `turns_source` says `transcript` — the two are not
+measured the same way and should not be compared as if they were.
 
 ## Useful flags
 
