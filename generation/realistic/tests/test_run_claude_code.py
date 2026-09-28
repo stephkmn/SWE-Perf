@@ -7,6 +7,7 @@ checkout that still has history) can be exercised as strings.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -15,7 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import pytest
 
 from run_claude_code import (
-    BUILD_ARTIFACT_RE, MARKER, TEST_PATH_RE, VERBATIM_TEMPLATE,
+    BUILD_ARTIFACT_RE, MARKER, TEST_PATH_RE,
     agent_environment, baseline_problems, build_baseline_script, build_prompt,
     build_verify_script, claude_command, classify_worktree, filtered_by,
     is_scratch, looks_like_usage_limit, parse_baseline_report, parse_markers,
@@ -24,6 +25,8 @@ from run_claude_code import (
     classify_claude_failure, earns_a_prediction, parse_result_line,
     KEEP_STATUSES, PARTIAL_STATUSES, count_assistant_turns, count_tool_calls,
     earns_a_partial_prediction, partial_stem, run_paths, turn_count,
+    ARMS, CONSTRAINT_BLOCK, RUN_LOG_FIELDS, append_jsonl, hint_sentence,
+    patch_touches_tests, prompt_style_for, run_log_record, termination_for,
 )
 
 
@@ -272,21 +275,127 @@ class TestBaselineVerification:
 
 
 class TestPrompt:
-    def test_is_the_dataset_text_verbatim(self):
-        statement = "Optimize `foo`.\n\nRules:\n1. {not a format field}\n100% faster"
-        inst = {"instance_id": "x__y-1", "problem_statement_realistic": statement}
-        assert build_prompt(inst) == statement
+    """The prompt is protocol, so these assert on the bytes, not the shape."""
 
-    def test_template_adds_nothing(self):
-        assert VERBATIM_TEMPLATE == "{problem_statement}"
+    ISSUE = "Make `foo` faster.\n\nIt is slow on large inputs."
+
+    EXPECTED_NO_HINT = (
+        "Make `foo` faster.\n"
+        "\n"
+        "It is slow on large inputs.\n"
+        "\n"
+        "Constraints:\n"
+        "- Do not modify, delete, or skip any existing test.\n"
+        "- Preserve the program's behavior; only performance may change.\n"
+        "- When you are done, the final state of the working tree is your patch.\n"
+        "  It will be taken as a unified diff against the starting commit."
+    )
+
+    EXPECTED_HINTED = EXPECTED_NO_HINT + (
+        "\nThe developer's fix for this issue changed src/foo.py, "
+        "in Foo.compute, Foo.reduce."
+    )
+
+    def inst(self, iid="repo__repo-1"):
+        return {"instance_id": iid, "problem_statement_realistic": self.ISSUE}
+
+    def test_no_hint_prompt_is_byte_for_byte(self):
+        assert build_prompt(self.inst(), "no-hint") == self.EXPECTED_NO_HINT
+
+    def test_hinted_prompt_is_byte_for_byte(self):
+        hints = {"repo__repo-1": {"file": "src/foo.py",
+                                  "methods": ["Foo.compute", "Foo.reduce"]}}
+        assert build_prompt(self.inst(), "hinted", hints) == self.EXPECTED_HINTED
+
+    def test_the_arms_differ_by_exactly_one_line(self):
+        hints = {"repo__repo-1": {"file": "src/foo.py",
+                                  "methods": ["Foo.compute", "Foo.reduce"]}}
+        plain = build_prompt(self.inst(), "no-hint")
+        hinted = build_prompt(self.inst(), "hinted", hints)
+        extra = hinted[len(plain):].splitlines()
+        assert hinted.startswith(plain)
+        assert extra == ["", "The developer's fix for this issue changed "
+                             "src/foo.py, in Foo.compute, Foo.reduce."]
+
+    def test_the_issue_text_is_verbatim_and_first(self):
+        assert build_prompt(self.inst(), "no-hint").startswith(self.ISSUE)
+
+    def test_a_blank_line_separates_issue_and_constraints(self):
+        assert self.ISSUE + "\n\n" + CONSTRAINT_BLOCK == \
+            build_prompt(self.inst(), "no-hint")
+
+    def test_nothing_about_benchmarks_or_speedup_is_added(self):
+        # The protocol forbids role text, examples, and any mention of the
+        # benchmark: the model must not know it is being timed.
+        added = build_prompt(self.inst(), "no-hint")[len(self.ISSUE):].lower()
+        for word in ("benchmark", "speedup", "speed up", "swe-perf",
+                     "you are a", "for example", "performance engineer",
+                     "your task is", "expert"):
+            assert word not in added, word
+
+    def test_a_single_method_needs_no_list(self):
+        assert hint_sentence({"file": "a/b.py", "methods": "solve"}) == (
+            "The developer's fix for this issue changed a/b.py, in solve.")
 
     def test_falls_back_to_problem_statement(self):
-        inst = {"instance_id": "x__y-1", "problem_statement": "text"}
-        assert build_prompt(inst) == "text"
+        inst = {"instance_id": "x__y-1", "problem_statement": self.ISSUE}
+        assert build_prompt(inst, "no-hint") == self.EXPECTED_NO_HINT
 
-    def test_missing_statement_raises(self):
-        with pytest.raises(KeyError):
-            build_prompt({"instance_id": "x__y-1"})
+    def test_unknown_arm_is_refused(self):
+        with pytest.raises(ValueError):
+            build_prompt(self.inst(), "sideways")
+
+
+class TestMissingHintFailsLoudly:
+    ISSUE = "slow"
+
+    def inst(self, iid="repo__repo-1"):
+        return {"instance_id": iid, "problem_statement_realistic": self.ISSUE}
+
+    def test_no_entry_at_all(self):
+        with pytest.raises(KeyError, match="repo__repo-1"):
+            build_prompt(self.inst(), "hinted", {})
+
+    def test_hints_for_a_different_instance(self):
+        with pytest.raises(KeyError, match="repo__repo-1"):
+            build_prompt(self.inst(), "hinted",
+                         {"other__other-2": {"file": "a.py", "methods": ["m"]}})
+
+    def test_entry_missing_the_file(self):
+        with pytest.raises(KeyError, match="file"):
+            build_prompt(self.inst(), "hinted",
+                         {"repo__repo-1": {"methods": ["m"]}})
+
+    def test_entry_missing_the_methods(self):
+        with pytest.raises(KeyError, match="methods"):
+            build_prompt(self.inst(), "hinted",
+                         {"repo__repo-1": {"file": "a.py"}})
+
+    def test_empty_methods_list_is_not_a_hint(self):
+        with pytest.raises(KeyError, match="methods"):
+            build_prompt(self.inst(), "hinted",
+                         {"repo__repo-1": {"file": "a.py", "methods": []}})
+
+    def test_no_hint_arm_never_needs_hints(self):
+        assert build_prompt(self.inst(), "no-hint", {})
+
+
+class TestArmsKeepOutputsApart:
+    def test_each_arm_gets_its_own_files(self, tmp_path):
+        out = tmp_path / "claude_code_preds.jsonl"
+        plain = run_paths(out, 1, 1, "no-hint")
+        hinted = run_paths(out, 1, 1, "hinted")
+        assert plain[0].name == "claude_code_preds_no-hint.jsonl"
+        assert hinted[0].name == "claude_code_preds_hinted.jsonl"
+        # No path of one arm may collide with any path of the other.
+        assert not set(plain) & set(hinted)
+
+    def test_prompt_style_names_the_arm(self):
+        assert prompt_style_for("no-hint") == "verbatim+constraints"
+        assert prompt_style_for("hinted") == "verbatim+constraints+hint"
+
+    def test_both_arms_are_offered(self):
+        assert ARMS == ("no-hint", "hinted")
 
 
 class TestClaudeCommand:
@@ -617,19 +726,17 @@ class TestPartialPredictions:
 class TestPartialPath:
     def test_partial_sits_beside_the_predictions_file(self, tmp_path):
         out = tmp_path / "claude_code_pilot2_preds.jsonl"
-        preds, meta, prov, partial = run_paths(out, 1, 1)
-        assert preds == out
-        assert partial == tmp_path / "claude_code_pilot2_partial_preds.jsonl"
-        assert meta.name == "claude_code_pilot2_preds_meta.jsonl"
-        assert prov.name == "claude_code_pilot2_preds_provenance.jsonl"
+        preds, meta, prov, partial = run_paths(out, 1, 1, "no-hint")
+        assert preds.name == "claude_code_pilot2_preds_no-hint.jsonl"
+        assert partial.name == "claude_code_pilot2_partial_preds_no-hint.jsonl"
+        assert meta.name == "claude_code_pilot2_preds_no-hint_meta.jsonl"
+        assert prov.name == "claude_code_pilot2_preds_no-hint_provenance.jsonl"
 
     def test_each_run_of_a_repeat_sweep_gets_its_own_partial(self, tmp_path):
         out = tmp_path / "claude_code_preds.jsonl"
-        preds, _, _, partial = run_paths(out, 2, 3)
-        # The run suffix lands last, so the stem no longer ends in `_preds`
-        # and the marker is simply appended -- still unique per run.
-        assert preds.name == "claude_code_preds_run2.jsonl"
-        assert partial.name == "claude_code_preds_run2_partial.jsonl"
+        preds, _, _, partial = run_paths(out, 2, 3, "hinted")
+        assert preds.name == "claude_code_preds_run2_hinted.jsonl"
+        assert partial.name == "claude_code_partial_preds_run2_hinted.jsonl"
 
     def test_a_name_that_does_not_end_in_preds_is_suffixed(self):
         assert partial_stem("results") == "results_partial"
@@ -639,5 +746,176 @@ class TestPartialPath:
 
     def test_the_partial_path_is_never_the_predictions_path(self, tmp_path):
         for name in ("a_preds.jsonl", "results.jsonl", "preds.jsonl"):
-            preds, _, _, partial = run_paths(tmp_path / name, 1, 1)
-            assert preds != partial
+            for arm in ARMS:
+                preds, _, _, partial = run_paths(tmp_path / name, 1, 1, arm)
+                assert preds != partial
+
+
+class Args:
+    """The handful of argparse fields the run log reads."""
+    def __init__(self, **kw):
+        self.model = "claude-opus-5"
+        self.effort = "high"
+        self.max_turns = 2000
+        self.timeout = 10800
+        self.operator = "SN"
+        self.notes = ""
+        self.__dict__.update(kw)
+
+
+def meta_for(status="ok", **kw):
+    m = {
+        "instance_id": "repo__repo-1", "arm": "no-hint", "status": status,
+        "turns": 215, "turns_source": "result_line", "tool_calls": 214,
+        "duration_s": 2209.0, "claude_version": "2.1.283 (Claude Code)",
+        "claude_result": {"usage": {
+            "input_tokens": 396, "output_tokens": 144656,
+            "cache_creation_input_tokens": 309255,
+            "cache_read_input_tokens": 36948640,
+        }},
+    }
+    m.update(kw)
+    return m
+
+
+class TestTerminationMapping:
+    def test_a_clean_run_finished(self):
+        assert termination_for("ok") == "finished"
+
+    def test_a_deliberate_no_change_finished(self):
+        # The agent ran to completion; changing nothing is a finished run.
+        assert termination_for("empty_patch") == "finished"
+
+    def test_an_exhausted_turn_budget_is_the_turn_limit(self):
+        assert termination_for("max_turns") == "turn_limit"
+
+    def test_a_killed_run_is_the_time_limit(self):
+        assert termination_for("timeout") == "time_limit"
+
+    @pytest.mark.parametrize("status", [
+        "error", "setup_failed", "auth_failed", "usage_limit", "api_error",
+        "claude_exit_1", "cancelled",
+    ])
+    def test_everything_else_is_an_error(self, status):
+        assert termination_for(status) == "error"
+
+    def test_an_unknown_status_is_an_error_not_finished(self):
+        # A status added later must never read as a completed run.
+        assert termination_for("some_future_status") == "error"
+
+    def test_the_mapping_agrees_with_the_status_groups(self):
+        # Nothing is derived twice: every kept status finishes, and the two
+        # partial statuses are exactly the two limit terminations.
+        for status in KEEP_STATUSES:
+            assert termination_for(status) == "finished"
+        assert {termination_for(s) for s in PARTIAL_STATUSES} == \
+            {"turn_limit", "time_limit"}
+
+
+class TestRunLogLine:
+    def test_it_has_exactly_the_listed_fields(self, tmp_path):
+        rec = run_log_record(meta_for(), Args(), "", tmp_path / "p.jsonl",
+                             tmp_path / "t.jsonl")
+        assert tuple(rec) == RUN_LOG_FIELDS
+
+    def test_no_extra_and_no_missing_keys(self, tmp_path):
+        rec = run_log_record(meta_for(), Args(), "", None, None)
+        assert set(rec) == set(RUN_LOG_FIELDS)
+        assert len(rec) == len(RUN_LOG_FIELDS)
+
+    def test_values_come_from_the_run(self, tmp_path):
+        rec = run_log_record(meta_for(), Args(notes="pilot 2 rerun"),
+                             "", tmp_path / "p.jsonl", tmp_path / "t.jsonl")
+        assert rec["issue_id"] == "repo__repo-1"
+        assert rec["arm"] == "no-hint"
+        assert rec["model_id"] == "claude-opus-5"
+        assert rec["harness"] == "claude-code"
+        assert rec["harness_version"] == "2.1.283 (Claude Code)"
+        assert rec["effort"] == "high"
+        assert rec["max_turns"] == 2000
+        assert rec["max_wall_clock_s"] == 10800
+        assert rec["turns_used"] == 215
+        assert rec["tokens_in"] == 396 + 309255 + 36948640
+        assert rec["tokens_out"] == 144656
+        assert rec["wall_clock_s"] == 2209.0
+        assert rec["termination"] == "finished"
+        assert rec["operator"] == "SN"
+        assert rec["notes"] == "pilot 2 rerun"
+        assert rec["patch_path"].endswith("p.jsonl")
+        assert rec["trajectory_path"].endswith("t.jsonl")
+
+    def test_the_model_id_is_the_exact_string(self):
+        rec = run_log_record(meta_for(), Args(model="claude-opus-5[1m]"), "", None, None)
+        assert rec["model_id"] == "claude-opus-5[1m]"
+
+    def test_a_run_with_no_patch_records_no_patch_path(self):
+        rec = run_log_record(meta_for("error"), Args(), "", None, None)
+        assert rec["patch_path"] is None
+        assert rec["termination"] == "error"
+
+    def test_tokens_in_counts_cache_reads_and_creation(self):
+        # `input_tokens` alone understated xarray's pilot by five orders of
+        # magnitude, which would make the run log useless for cost analysis.
+        rec = run_log_record(meta_for(), Args(), "", None, None)
+        assert rec["tokens_in"] == 36_948_640 + 309_255 + 396
+
+    def test_the_full_breakdown_stays_in_meta(self):
+        meta = meta_for()
+        run_log_record(meta, Args(), "", None, None)
+        usage = meta["claude_result"]["usage"]
+        assert usage["input_tokens"] == 396
+        assert usage["cache_read_input_tokens"] == 36948640
+        assert usage["cache_creation_input_tokens"] == 309255
+
+    def test_a_partial_usage_block_still_sums(self):
+        # A result line that reports no cache fields must not produce None.
+        meta = meta_for(claude_result={"usage": {"input_tokens": 10,
+                                                 "output_tokens": 20}})
+        assert run_log_record(meta, Args(), "", None, None)["tokens_in"] == 10
+
+    def test_a_missing_result_line_leaves_tokens_null(self):
+        rec = run_log_record(meta_for("timeout", claude_result={}), Args(),
+                             "", None, None)
+        assert rec["tokens_in"] is None and rec["tokens_out"] is None
+        assert rec["termination"] == "time_limit"
+
+    def test_run_date_is_iso_and_json_serialisable(self):
+        rec = run_log_record(meta_for(), Args(), "", None, None)
+        assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", rec["run_date"])
+        json.loads(json.dumps(rec))
+
+    def test_it_is_appended_never_rewritten(self, tmp_path):
+        path = tmp_path / "pilot_runs.jsonl"
+        append_jsonl(path, run_log_record(meta_for(), Args(), "", None, None))
+        append_jsonl(path, run_log_record(meta_for("timeout"), Args(), "", None, None))
+        lines = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
+        assert [l["termination"] for l in lines] == ["finished", "time_limit"]
+
+
+class TestModifiedTestsFlag:
+    def test_a_library_only_patch_is_false(self):
+        patch = ("diff --git a/sympy/core/basic.py b/sympy/core/basic.py\n"
+                 "--- a/sympy/core/basic.py\n+++ b/sympy/core/basic.py\n")
+        assert patch_touches_tests(patch) is False
+
+    def test_a_patch_touching_a_test_is_true(self):
+        patch = ("diff --git a/sympy/core/basic.py b/sympy/core/basic.py\n"
+                 "diff --git a/sympy/core/tests/test_basic.py "
+                 "b/sympy/core/tests/test_basic.py\n")
+        assert patch_touches_tests(patch) is True
+
+    def test_conftest_counts(self):
+        assert patch_touches_tests("diff --git a/conftest.py b/conftest.py\n") is True
+
+    def test_library_code_under_testing_is_not_a_test(self):
+        # xarray/testing/assertions.py is shipped library code, not a suite.
+        patch = ("diff --git a/xarray/testing/assertions.py "
+                 "b/xarray/testing/assertions.py\n")
+        assert patch_touches_tests(patch) is False
+
+    def test_an_empty_patch_is_false(self):
+        assert patch_touches_tests("") is False
+
+    def test_it_reaches_the_run_log(self):
+        patch = "diff --git a/pkg/tests/test_x.py b/pkg/tests/test_x.py\n"
+        assert run_log_record(meta_for(), Args(), patch, None, None)["modified_tests"]

@@ -5,8 +5,13 @@
 environment the benchmark later measures it in.
 
 ```
-python generation/realistic/run_claude_code.py --model claude-opus-5 --effort xhigh
+python generation/realistic/run_claude_code.py \
+  --model claude-opus-5 --cli_version 2.1.283 --arm no-hint --operator SN
 ```
+
+`--model`, `--cli_version`, `--arm` and `--operator` are all required: the
+model, the harness version, the experimental arm and who ran it are the four
+things a result is meaningless without, so none of them may be defaulted.
 
 ## What a run does, per instance
 
@@ -20,9 +25,89 @@ python generation/realistic/run_claude_code.py --model claude-opus-5 --effort xh
    Claude *must* run non-root — `--dangerously-skip-permissions` refuses root.
 3. Rewrites `/testbed` into a repository with exactly one commit and verifies it:
    `git log --all` = 1, no tags, no remotes, no reflog, clean tree.
-4. Runs Claude with the dataset's `problem_statement_realistic`, verbatim.
-5. Filters the working tree and takes `git diff` against that one commit.
-6. Removes the container. Images are never removed.
+4. Checks, inside the container, that the egress allowlist is actually in
+   force (see *Network*). If it is not, the instance is abandoned as an
+   infrastructure failure and no prediction is written.
+5. Runs Claude with the dataset's issue text plus the constraint block (see
+   *The prompt*).
+6. Filters the working tree and takes `git diff` against that one commit.
+7. Appends one line to the run log and removes the container. Images are never
+   removed.
+
+## The prompt
+
+The issue text (`problem_statement_realistic`) verbatim, a blank line, then
+this block — and, on the hinted arm, one further line:
+
+```
+Constraints:
+- Do not modify, delete, or skip any existing test.
+- Preserve the program's behavior; only performance may change.
+- When you are done, the final state of the working tree is your patch.
+  It will be taken as a unified diff against the starting commit.
+```
+
+Nothing else is added: no role text, no examples, no mention of benchmarks or
+speedup. `prompt_sha256` in each meta line is taken over the **full** prompt
+actually sent.
+
+## Arms
+
+`--arm` is required and selects the experiment:
+
+| arm | prompt |
+| --- | --- |
+| `no-hint` | issue text + constraint block |
+| `hinted` | the same, plus one line naming where the developer's fix landed |
+
+The hinted line is exactly:
+
+```
+The developer's fix for this issue changed <file path>, in <method name(s)>.
+```
+
+It never carries patch content — that would make the task transcription rather
+than optimisation. `hinted` requires `--hints_file`, a JSON object:
+
+```json
+{"pydata__xarray-7206": {"file": "xarray/core/computation.py",
+                         "methods": ["polyval", "_ensure_numeric"]}}
+```
+
+Every hinted instance must have an entry. A missing one aborts the whole sweep
+**before the first image is pulled** — a hinted run that quietly fell back to
+the no-hint prompt would be recorded as hinted and ruin the comparison.
+
+The arm is recorded in every meta line, in provenance, and in every output
+filename, so the two arms can never overwrite each other.
+
+## Network
+
+`--disallowedTools` only stops the agent asking Claude Code for a fetch. It
+does nothing about `python -c "import urllib"`, `pip install` or `git clone`,
+all of which worked on Docker's default bridge. So each sweep creates:
+
+- an **`--internal` Docker network** — no route off it, and no external DNS;
+- a small **CONNECT proxy container**, dual-homed on that network and the
+  default bridge, which allowlists `api.anthropic.com` and refuses everything
+  else with a 403.
+
+CONNECT-only on purpose: a plain HTTP proxy would have to allowlist on the
+`Host:` header, which the request itself chooses, so it would be no control at
+all. `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` keeps the CLI off
+statsig/sentry, which the allowlist would refuse anyway.
+
+Before every instance, a preflight inside the container proves the policy:
+
+| check | required |
+| --- | --- |
+| `api.anthropic.com` through the proxy | `200 Connection established` |
+| `github.com`, `pypi.org` through the proxy | `403 Forbidden` |
+| `github.com`, `pypi.org` directly | unreachable |
+
+If any of those fails the instance is abandoned as `setup_failed` — an
+infrastructure failure, never a model result. The mode, the allowlist and the
+deny probes are recorded in provenance.
 
 ## The baseline is the image's post-setup tree, not `base_commit`
 
@@ -70,6 +155,10 @@ sweep, no per-instance cost, and the agent cannot modify its own binary.
 versions; they are copied into every provenance record. Rebuild with
 `--bootstrap_cli`, or build it alone with `--bootstrap_only`.
 
+`--cli_version` is **required** and must be an exact version (e.g. `2.1.283`),
+never `latest`: the harness version is part of the result, and two arms
+compared across a silent CLI upgrade are not comparable.
+
 At bootstrap the driver checks the *installed* CLI rather than assuming the
 host's contract: `--effort` (with the requested level), `--model`,
 `--output-format`, `--max-turns`, `--disallowedTools`,
@@ -100,12 +189,15 @@ dropped path is recorded in the run's `_meta.jsonl`, with the reason.
 
 ## Output
 
-Beside `--output` (default `datasets/outputs/claude_code_preds.jsonl`):
+Beside `--output` (default `datasets/outputs/claude_code_preds.jsonl`). Every
+name carries the arm, so the two arms never collide — with
+`--arm no-hint` the predictions file is `claude_code_preds_no-hint.jsonl` and
+the partial file `claude_code_partial_preds_no-hint.jsonl`:
 
-- `..._preds.jsonl` — `{instance_id, model_name_or_path, model_patch}`, ready for `evaluation/run_evaluation.py`
-- `..._meta.jsonl` — per instance: status, image, conda env, baseline report, filtered paths, prompt hash, CLI version, `claude_result`, web-access audit hits, plus effort spent — `duration_s`, `turns`, `turns_source`, `tool_calls`
-- `..._partial_preds.jsonl` — same format as the predictions file, but only the diffs from runs cut off by `timeout` or `max_turns`. Never fed to the evaluator: a mid-edit tree is an unfinished attempt, not a result. Kept so a three-hour run is readable instead of lost.
-- `..._provenance.jsonl` — per run: `execution_env: "docker_with_deps"`, image names, model, effort, CLI/Node versions, tool allow/deny lists, prompt style and hashes
+- `..._<arm>.jsonl` — `{instance_id, model_name_or_path, model_patch}`, ready for `evaluation/run_evaluation.py`
+- `..._meta.jsonl` — per instance: `arm`, status, image, conda env, baseline report, filtered paths, prompt hash, CLI version, `claude_result` (with the full token breakdown), egress preflight markers, web-access audit hits, plus effort spent — `duration_s`, `turns`, `turns_source`, `tool_calls`
+- `..._partial_preds_<arm>.jsonl` — same format as the predictions file, but only the diffs from runs cut off by `timeout` or `max_turns`. Never fed to the evaluator: a mid-edit tree is an unfinished attempt, not a result. Kept so a three-hour run is readable instead of lost.
+- `..._provenance.jsonl` — per run: `execution_env: "docker_with_deps"`, image names, model, effort, `arm`, CLI/Node versions, tool allow/deny lists, prompt style and hashes, `network_mode`, the egress allowlist and deny probes
 - `claude_code_logs/run<N>/<id>.jsonl` — the full stream-json transcript
 - `claude_code_logs/run<N>/<id>.stderr.txt`
 
@@ -119,16 +211,56 @@ line. A killed run never prints one, so the turns are counted off the saved
 transcript instead and `turns_source` says `transcript` — the two are not
 measured the same way and should not be compared as if they were.
 
+## The run log (`--runs_log`)
+
+One JSON line appended per instance run, default
+`data/interim/pilot_runs.jsonl`. Append-only: it is never rewritten, so it
+accumulates across sweeps and arms.
+
+```
+issue_id, arm, model_id, harness, harness_version, effort, max_turns,
+max_wall_clock_s, turns_used, tokens_in, tokens_out, wall_clock_s,
+termination, patch_path, modified_tests, trajectory_path, run_date,
+operator, notes
+```
+
+`termination` is derived from the run's status, not re-measured:
+
+| status | termination |
+| --- | --- |
+| `ok`, `empty_patch` | `finished` |
+| `max_turns` | `turn_limit` |
+| `timeout` | `time_limit` |
+| anything else, including infrastructure failures | `error` |
+
+`tokens_in` is every input token consumed — `input_tokens` plus
+`cache_creation_input_tokens` plus `cache_read_input_tokens`. `input_tokens`
+alone is misleading by orders of magnitude on an agentic run (one pilot
+instance billed 396 there against 36.9M cache reads); the unsummed breakdown
+stays in the meta line.
+
+`modified_tests` is a check on the test filter, not a description of what the
+agent tried: it should be `false` on every kept patch, because test edits are
+reverted before the diff is taken. What the agent tried is in meta's
+`reverted_tests`.
+
 ## Useful flags
 
 | flag | |
 | --- | --- |
 | `--model` | **required**; full model ID, e.g. `claude-opus-5` |
-| `--effort` | `low`/`medium`/`high`/`xhigh`/`max` (default `xhigh`) |
+| `--cli_version` | **required**; exact CLI version, e.g. `2.1.283` |
+| `--arm` | **required**; `no-hint` or `hinted` |
+| `--operator` | **required**; initials, recorded on every run-log line |
+| `--hints_file` | required by `--arm hinted`; rejected with `no-hint` |
+| `--effort` | `low`/`medium`/`high`/`xhigh`/`max` (default `high`) |
+| `--max_turns` | agentic turn cap (default 2000) |
+| `--timeout` | per-instance wall clock, default 10800s, enforced inside the container |
+| `--runs_log` | run log to append to (default `data/interim/pilot_runs.jsonl`) |
+| `--notes` | free text copied to the run log |
 | `--instance_ids` | run only these |
 | `--num_runs` | repeat the sweep; each run gets its own predictions file |
 | `--resume` | skip instances already written for that run |
-| `--timeout` | per-instance wall clock, default 1800s, enforced inside the container |
 | `--keep_containers` | leave containers running for debugging |
 | `--bootstrap_only` | build the CLI cache and exit |
 

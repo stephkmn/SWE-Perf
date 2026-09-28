@@ -102,15 +102,52 @@ ALLOWED_TOOLS = ["Edit", "Read", "Write", "Glob", "Grep", "Bash"]
 # do from the source tree alone, not what it can look up about the upstream fix.
 DISALLOWED_TOOLS = ["WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"]
 
+# Egress policy. DISALLOWED_TOOLS above only stops the agent asking Claude Code
+# for a fetch; it does nothing about `python -c "import urllib"`, `pip install`
+# or `git clone`, all of which worked on Docker's default bridge. So the run is
+# put on an --internal network with no route and no DNS, and the only way out
+# is a CONNECT proxy that allowlists the hosts the CLI itself needs.
+EGRESS_ALLOW_HOSTS = ("api.anthropic.com",)
+
+# Checked, per instance, to be unreachable. If either of these ever answers,
+# the isolation has broken and the instance is not a valid data point.
+EGRESS_DENY_PROBES = ("github.com", "pypi.org")
+
+PROXY_PORT = 8080
+PROXY_SCRIPT_PATH = "/opt/sweperf_egress_proxy.py"
+PROXY_LOG_PATH = "/tmp/sweperf_egress_proxy.log"
+NETWORK_MODE = "internal+allowlist_proxy"
+
 # Substrings that, if they show up in a tool_use input, suggest the sandbox was
 # probed for network access or repo history. Matched case-insensitively.
 AUDIT_PATTERNS = ["http://", "https://", "github.com", "git log --all", "pip download"]
 
-# problem_statement_realistic already carries the benchmark's own four rules, so
-# it is sent untouched. This is the apples-to-apples comparison against
-# published SWE-Perf numbers, and it is now the only supported prompt.
-VERBATIM_TEMPLATE = "{problem_statement}"
-PROMPT_STYLE = "verbatim"
+# The prompt is the dataset's issue text verbatim, followed by the RQ1 pilot
+# protocol's constraint block. Nothing else is added: no role text, no
+# examples, no mention of benchmarks or speedup, because any of those would
+# make the run incomparable to the published SWE-Perf numbers.
+#
+# The block is a protocol constant, not something to reword. It is written out
+# here exactly as it is sent, so a reviewer can diff it against the spec.
+CONSTRAINT_BLOCK = """Constraints:
+- Do not modify, delete, or skip any existing test.
+- Preserve the program's behavior; only performance may change.
+- When you are done, the final state of the working tree is your patch.
+  It will be taken as a unified diff against the starting commit."""
+
+PROMPT_TEMPLATE = "{problem_statement}\n\n" + CONSTRAINT_BLOCK
+
+# The hinted arm adds one sentence and nothing more. It names where the
+# developer's fix landed; it never carries patch content, which would turn the
+# task into transcription.
+HINT_TEMPLATE = ("The developer's fix for this issue changed {file}, "
+                 "in {methods}.")
+
+ARMS = ("no-hint", "hinted")
+
+
+def prompt_style_for(arm: str) -> str:
+    return "verbatim+constraints" + ("+hint" if arm == "hinted" else "")
 
 # Intentionally does NOT match `testing/`: that is library code in several of the
 # benchmark repos (e.g. xarray/testing/assertions.py), not a test suite.
@@ -160,6 +197,23 @@ def earns_a_prediction(status: str) -> bool:
 
 def earns_a_partial_prediction(status: str) -> bool:
     return status in PARTIAL_STATUSES
+
+
+# The run log's four-way vocabulary, expressed over the statuses this driver
+# already produces rather than re-derived from the result line. `max_turns` and
+# `timeout` are exactly the two PARTIAL_STATUSES; everything that is neither a
+# kept result nor one of those is an error, including the infrastructure
+# failures, which must never read as "the model finished".
+TERMINATION_BY_STATUS = {
+    "max_turns": "turn_limit",
+    "timeout": "time_limit",
+}
+
+
+def termination_for(status: str) -> str:
+    if earns_a_prediction(status):
+        return "finished"
+    return TERMINATION_BY_STATUS.get(status, "error")
 
 
 # Matched against the agent's own error text, never against the whole result
@@ -410,9 +464,73 @@ def problem_statement_for(inst):
     raise KeyError(f"no problem statement on {inst['instance_id']}")
 
 
-def build_prompt(inst):
-    """The dataset's own text, verbatim, with nothing added."""
-    return VERBATIM_TEMPLATE.format(problem_statement=problem_statement_for(inst))
+def hint_sentence(entry: dict) -> str:
+    """The one sentence the hinted arm appends.
+
+    `methods` is a list because a fix can span several; they are joined in the
+    order the hints file gives them, so the sentence is reproducible.
+    """
+    methods = entry.get("methods") or []
+    if isinstance(methods, str):
+        methods = [methods]
+    return HINT_TEMPLATE.format(file=entry.get("file", ""),
+                                methods=", ".join(str(m) for m in methods))
+
+
+def build_prompt(inst, arm: str = "no-hint", hints: Optional[dict] = None) -> str:
+    """Issue text, a blank line, the constraint block -- and, hinted, the hint.
+
+    The hinted sentence goes on its own line after the block, so the two arms
+    differ by exactly that line and nothing else.
+    """
+    if arm not in ARMS:
+        raise ValueError(f"unknown arm: {arm!r}")
+    prompt = PROMPT_TEMPLATE.format(problem_statement=problem_statement_for(inst))
+    if arm == "no-hint":
+        return prompt
+    iid = inst["instance_id"]
+    entry = (hints or {}).get(iid)
+    # Loudly, and before any container starts: a hinted run that silently fell
+    # back to the no-hint prompt would be recorded as hinted and quietly ruin
+    # the comparison the whole experiment exists to make.
+    if not entry:
+        raise KeyError(
+            f"--arm hinted but no hint for {iid} in the hints file. "
+            f"Every hinted instance needs an entry of the form "
+            f'{{"file": ..., "methods": [...]}}.'
+        )
+    missing = [k for k in ("file", "methods") if not entry.get(k)]
+    if missing:
+        raise KeyError(f"hint for {iid} is missing: {', '.join(missing)}")
+    return prompt + "\n" + hint_sentence(entry)
+
+
+def prompt_template_for(arm: str) -> str:
+    """The run-level prompt shape, hashed into provenance.
+
+    A single string, because analysis/provenance_audit.py compares this field
+    against one expected hash. Per-instance hashes of the full prompt actually
+    sent go in `prompt_sha256_by_instance` and in each instance's meta line.
+    """
+    if arm == "hinted":
+        return PROMPT_TEMPLATE + "\n" + HINT_TEMPLATE
+    return PROMPT_TEMPLATE
+
+
+def load_hints(path: Optional[str]) -> dict:
+    """instance_id -> {"file": ..., "methods": [...]}."""
+    if not path:
+        return {}
+    hints_path = Path(path).resolve()
+    if not hints_path.exists():
+        sys.exit(f"error: no such hints file: {hints_path}")
+    try:
+        data = json.loads(hints_path.read_text())
+    except json.JSONDecodeError as exc:
+        sys.exit(f"error: {hints_path} is not valid JSON: {exc}")
+    if not isinstance(data, dict):
+        sys.exit(f"error: {hints_path} must be an object keyed by instance_id")
+    return data
 
 
 def sha256_16(text: str) -> str:
@@ -541,7 +659,7 @@ def env_name_for(test_spec) -> str:
     return match.group(1) if match else "testbed"
 
 
-def agent_environment(env_name: str, token: str = "") -> dict:
+def agent_environment(env_name: str, token: str = "", proxy_host: str = "") -> dict:
     """Environment for every exec run as the agent user.
 
     PATH puts the instance's conda env first so `python` and `pytest` resolve
@@ -554,6 +672,10 @@ def agent_environment(env_name: str, token: str = "") -> dict:
 
     The token is added only when one is passed, so the setup and extraction
     execs never carry a credential they have no use for.
+
+    The proxy variables are what let the CLI reach the Anthropic API at all:
+    the container has no route of its own. They are set for every exec, so the
+    preflight check measures the same path the agent will use.
     """
     conda_bin = f"{CONDA_ROOT}/envs/{env_name}/bin"
     path = ":".join([
@@ -578,7 +700,16 @@ def agent_environment(env_name: str, token: str = "") -> dict:
         # read-only, so an update attempt would only produce noise anyway.
         "DISABLE_AUTOUPDATER": "1",
         "CLAUDE_CONFIG_DIR": f"{AGENT_HOME}/.claude",
+        # Keeps the CLI off statsig/sentry, which the egress allowlist refuses
+        # anyway -- the refusals would just be noise in every transcript. Set
+        # unconditionally, so it holds on execs that carry no proxy host too.
+        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     }
+    if proxy_host:
+        proxy_url = f"http://{proxy_host}:{PROXY_PORT}"
+        env["HTTPS_PROXY"] = env["https_proxy"] = proxy_url
+        env["HTTP_PROXY"] = env["http_proxy"] = proxy_url
+        env["NO_PROXY"] = env["no_proxy"] = "localhost,127.0.0.1"
     if token:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = token
     return env
@@ -763,7 +894,253 @@ def remove_stale_container(client, name):
     cleanup_container(client, existing, "quiet")
 
 
-def create_instance_container(client, spec, run_id, cli_cache: Path):
+# --------------------------------------------------------------------------
+# egress control
+# --------------------------------------------------------------------------
+
+# Runs in its own container, dual-homed: on the run's internal network (where
+# the agent can reach it) and on the default bridge (where it can reach the
+# internet). Deliberately CONNECT-only -- a plain HTTP proxy would have to
+# allowlist on the Host: header, which the request itself chooses, so it is no
+# control at all.
+EGRESS_PROXY_SCRIPT = r"""#!/usr/bin/env python3
+import os, select, socket, sys, threading
+
+ALLOW = tuple(h.strip().lower() for h in os.environ.get("ALLOW_HOSTS", "").split(",") if h.strip())
+PORT = int(os.environ.get("PROXY_PORT", "8080"))
+
+
+def allowed(host):
+    host = host.lower().rstrip(".")
+    return any(host == a or host.endswith("." + a) for a in ALLOW)
+
+
+def pump(a, b):
+    try:
+        while True:
+            ready, _, _ = select.select([a, b], [], [], 300)
+            if not ready:
+                return
+            for s in ready:
+                data = s.recv(65536)
+                if not data:
+                    return
+                (b if s is a else a).sendall(data)
+    except OSError:
+        return
+
+
+def handle(conn):
+    upstream = None
+    try:
+        conn.settimeout(30)
+        buf = b""
+        while b"\r\n\r\n" not in buf:
+            chunk = conn.recv(4096)
+            if not chunk:
+                return
+            buf += chunk
+            if len(buf) > 65536:
+                return
+        line = buf.split(b"\r\n", 1)[0].decode("latin-1", "replace")
+        parts = line.split()
+        if len(parts) < 2 or parts[0].upper() != "CONNECT":
+            conn.sendall(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n")
+            print("REFUSE non-CONNECT %s" % line[:80], flush=True)
+            return
+        host, _, port = parts[1].rpartition(":")
+        if not host:
+            host, port = parts[1], "443"
+        if not allowed(host):
+            conn.sendall(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            print("REFUSE %s:%s" % (host, port), flush=True)
+            return
+        try:
+            upstream = socket.create_connection((host, int(port)), 20)
+        except OSError as exc:
+            conn.sendall(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
+            print("FAIL %s:%s %s" % (host, port, type(exc).__name__), flush=True)
+            return
+        print("ALLOW %s:%s" % (host, port), flush=True)
+        conn.sendall(b"HTTP/1.1 200 Connection established\r\n\r\n")
+        conn.settimeout(None)
+        upstream.settimeout(None)
+        pump(conn, upstream)
+    except OSError:
+        return
+    finally:
+        for s in (conn, upstream):
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
+
+
+def main():
+    if not ALLOW:
+        sys.exit("egress proxy: ALLOW_HOSTS is empty; refusing to start")
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", PORT))
+    srv.listen(64)
+    print("listening on %d, allow=%s" % (PORT, ",".join(ALLOW)), flush=True)
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        threading.Thread(target=handle, args=(conn,), daemon=True).start()
+
+
+main()
+"""
+
+
+def egress_names(run_id: str):
+    """(network name, proxy container name) for a sweep."""
+    return f"sweperf-egress-{run_id}", f"sweperf-proxy-{run_id}"
+
+
+def start_egress(client, image, run_id: str):
+    """Create the internal network and the allowlisting proxy on it.
+
+    Returns (network, container). The proxy is also attached to the default
+    bridge, which is what gives it -- and only it -- a way out.
+    """
+    if USE_HOST_NETWORK:
+        raise RuntimeError(
+            "evaluation/docker_build.py sets USE_HOST_NETWORK=True, which puts "
+            "the container straight on the host's network and defeats the "
+            "egress allowlist. Refusing to run: the isolation this protocol "
+            "depends on would be silently absent."
+        )
+    net_name, proxy_name = egress_names(run_id)
+    remove_stale_container(client, proxy_name)
+    try:
+        client.networks.get(net_name).remove()
+    except docker.errors.NotFound:
+        pass
+    network = client.networks.create(net_name, driver="bridge", internal=True)
+
+    proxy = client.containers.create(
+        image=image,
+        name=proxy_name,
+        user="root",
+        detach=True,
+        command="tail -f /dev/null",
+        platform="linux/x86_64",
+        mem_limit="512m",
+        network=net_name,
+    )
+    proxy.start()
+    # The second attachment is the whole point: on the internal network alone
+    # the proxy would be as cut off as the agent.
+    client.networks.get("bridge").connect(proxy)
+    write_container_bytes(proxy, PROXY_SCRIPT_PATH, EGRESS_PROXY_SCRIPT.encode())
+    allow = ",".join(EGRESS_ALLOW_HOSTS)
+    container_exec(
+        proxy,
+        ["/bin/sh", "-c",
+         f"ALLOW_HOSTS={allow} PROXY_PORT={PROXY_PORT} "
+         f"nohup python3 {PROXY_SCRIPT_PATH} > {PROXY_LOG_PATH} 2>&1 &"],
+        timeout=60,
+    )
+    return network, proxy
+
+
+def stop_egress(client, network, proxy, logger="quiet"):
+    if proxy is not None:
+        cleanup_container(client, proxy, logger)
+    if network is not None:
+        try:
+            network.remove()
+        except docker.errors.APIError:
+            pass
+
+
+PREFLIGHT_SCRIPT = """
+import socket, sys
+
+PROXY = ("{proxy_host}", {proxy_port})
+MARKER = "{marker}"
+
+
+def connect_via_proxy(host):
+    s = socket.create_connection(PROXY, 15)
+    try:
+        s.sendall(("CONNECT %s:443 HTTP/1.1\\r\\nHost: %s:443\\r\\n\\r\\n"
+                   % (host, host)).encode())
+        return s.recv(200).split(b"\\r\\n")[0].decode("latin-1", "replace")
+    finally:
+        s.close()
+
+
+def direct(host):
+    s = socket.create_connection((host, 443), 8)
+    s.close()
+
+
+for host in {allow!r}:
+    try:
+        status = connect_via_proxy(host)
+    except Exception as exc:
+        status = "ERROR %s" % type(exc).__name__
+    print(MARKER + "allow_" + host + "=" + status)
+
+for host in {deny!r}:
+    try:
+        status = connect_via_proxy(host)
+    except Exception as exc:
+        status = "ERROR %s" % type(exc).__name__
+    print(MARKER + "proxy_" + host + "=" + status)
+    try:
+        direct(host)
+        print(MARKER + "direct_" + host + "=REACHABLE")
+    except Exception as exc:
+        print(MARKER + "direct_" + host + "=blocked:" + type(exc).__name__)
+"""
+
+
+def preflight_egress(container, environment, proxy_host: str, timeout=180):
+    """Prove, inside the container, that the allowlist is actually in force.
+
+    Returns (problems, markers). A non-empty `problems` means the isolation is
+    not what the protocol claims, and the instance must be abandoned as an
+    infrastructure failure rather than recorded as a model result.
+    """
+    script = PREFLIGHT_SCRIPT.format(
+        proxy_host=proxy_host, proxy_port=PROXY_PORT, marker=MARKER,
+        allow=list(EGRESS_ALLOW_HOSTS), deny=list(EGRESS_DENY_PROBES),
+    )
+    path = f"{AGENT_HOME}/.sweperf_preflight.py"
+    write_container_bytes(container, path, script.encode())
+    code, out, err, timed_out = sh(
+        container, f"python3 {path}; rm -f {path}",
+        user=AGENT_USER, environment=environment, timeout=timeout)
+    markers = parse_markers(out)
+    problems = []
+    if timed_out or code != 0:
+        problems.append(f"network preflight did not run ({(out + err)[-400:]})")
+        return problems, markers
+
+    for host in EGRESS_ALLOW_HOSTS:
+        status = markers.get(f"allow_{host}", "")
+        if "200" not in status:
+            problems.append(
+                f"{host} is not reachable through the proxy ({status or 'no answer'}); "
+                f"Claude Code cannot run without it")
+    for host in EGRESS_DENY_PROBES:
+        via = markers.get(f"proxy_{host}", "")
+        if "403" not in via:
+            problems.append(f"{host} was not refused by the proxy ({via or 'no answer'})")
+        direct = markers.get(f"direct_{host}", "")
+        if not direct.startswith("blocked"):
+            problems.append(f"{host} is reachable without the proxy ({direct or 'no answer'})")
+    return problems, markers
+
+
+def create_instance_container(client, spec, run_id, cli_cache: Path, network: str):
     """A fresh container on the evaluation image, with the CLI cache mounted.
 
     docker_build.build_container() is the harness's own helper and would be the
@@ -775,7 +1152,8 @@ def create_instance_container(client, spec, run_id, cli_cache: Path):
       * platform  -- spec.platform, which test_spec.py pins to linux/x86_64
       * nano_cpus -- the repo's own value, clamped by LOCAL_MAX_NANO_CPUS
       * mem_limit -- LOCAL_MAX_MEM_LIMIT
-      * network   -- USE_HOST_NETWORK
+      * network   -- replaced: the run joins the sweep's internal network,
+                     whose only way out is the allowlisting proxy
 
     The container itself runs as root so setup can chown /testbed and write the
     agent's shell profile; Claude is exec'd into it as AGENT_USER.
@@ -792,7 +1170,7 @@ def create_instance_container(client, spec, run_id, cli_cache: Path):
         command="tail -f /dev/null",
         nano_cpus=nano_cpus,
         platform=spec.platform,
-        network_mode="host" if USE_HOST_NETWORK else None,
+        network=network,
         mem_limit=LOCAL_MAX_MEM_LIMIT,
         oom_kill_disable=False,
         oom_score_adj=1000,
@@ -932,7 +1310,7 @@ def cli_cache_manifest(cli_cache: Path) -> Optional[dict]:
 
 
 def bootstrap_cli(client, cli_cache: Path, image: str, cli_version: str,
-                  effort: str = "xhigh", force=False):
+                  effort: str = "high", force=False):
     """Install Node + the Claude Code CLI into the host-side cache, once.
 
     Why a mounted, pre-installed copy rather than installing per instance:
@@ -1136,7 +1514,7 @@ def container_cli_version(container, env_name, timeout=120):
     return text[0].strip() if text else "unknown"
 
 
-def run_claude(container, prompt, env_name, token, args, log_dir, iid):
+def run_claude(container, prompt, env_name, token, args, log_dir, iid, proxy_host):
     """Run headless Claude Code in the container, saving the full transcript.
 
     Returns (exit_code, timeout_error, claude_result, stdout, stderr). stdout
@@ -1146,7 +1524,7 @@ def run_claude(container, prompt, env_name, token, args, log_dir, iid):
     code, stdout, stderr, host_timeout = container_exec(
         container, cmd,
         user=AGENT_USER,
-        environment=agent_environment(env_name, token),
+        environment=agent_environment(env_name, token, proxy_host),
         workdir=REPO_DIR,
         # `timeout` inside the container owns the wall clock; the host join is
         # only there in case the exec stream itself wedges.
@@ -1236,7 +1614,7 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
     iid = inst["instance_id"]
     started = time.time()
     meta = {
-        "instance_id": iid, "run": run_idx, "status": "ok",
+        "instance_id": iid, "run": run_idx, "arm": args.arm, "status": "ok",
         "execution_env": "docker_with_deps",
         "reverted_tests": [], "removed_scratch_files": [], "new_files": [],
         "build_artifacts_filtered": [], "binary_files_dropped": [],
@@ -1251,12 +1629,17 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
         meta["image"] = spec.instance_image_key
         meta["conda_env"] = env_name
 
-        prompt = build_prompt(inst)
-        meta["prompt_style"] = PROMPT_STYLE
+        prompt = build_prompt(inst, args.arm, args.hints)
+        meta["prompt_style"] = prompt_style_for(args.arm)
+        # Over the full prompt actually sent -- issue text, constraint block
+        # and, on the hinted arm, the hint line.
         meta["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
 
+        net_name, proxy_host = egress_names(args.run_id)
+        meta["network_mode"] = NETWORK_MODE
         ensure_image(client, spec.instance_image_key)
-        container = create_instance_container(client, spec, args.run_id, cli_cache)
+        container = create_instance_container(client, spec, args.run_id,
+                                              cli_cache, net_name)
         container.start()
 
         code, out, err, timed_out = setup_agent_user(container, env_name)
@@ -1271,7 +1654,19 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
             meta["error"] = "; ".join(auth_problems)
             return None, meta, iid
 
-        agent_env = agent_environment(env_name)
+        agent_env = agent_environment(env_name, proxy_host=proxy_host)
+
+        # Before anything else touches the network: prove the allowlist is in
+        # force. A run on an open network is not the experiment this protocol
+        # describes, so it is abandoned as infrastructure rather than recorded.
+        egress_problems, egress_markers = preflight_egress(
+            container, agent_env, proxy_host)
+        meta["egress_preflight"] = egress_markers
+        if egress_problems:
+            meta["status"] = "setup_failed"
+            meta["error"] = "network isolation not in force: " + "; ".join(egress_problems)
+            return None, meta, iid
+
         report, problems, log = establish_baseline(container, agent_env)
         meta["baseline"] = report
         if problems:
@@ -1283,7 +1678,7 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
         meta["claude_version"] = container_cli_version(container, env_name)
 
         rc, err_text, result, stdout, stderr = run_claude(
-            container, prompt, env_name, token, args, log_dir, iid
+            container, prompt, env_name, token, args, log_dir, iid, proxy_host
         )
         if result is not None:
             meta["claude_result"] = result
@@ -1347,6 +1742,70 @@ def already_done(path: Path):
     return done
 
 
+# Exactly the fields the pilot protocol asks for, in its order. Written as a
+# tuple so the test can assert the line has these and nothing else: an extra
+# key here would quietly change the schema of a file meant to be appended to
+# across months of runs.
+RUN_LOG_FIELDS = (
+    "issue_id", "arm", "model_id", "harness", "harness_version", "effort",
+    "max_turns", "max_wall_clock_s", "turns_used", "tokens_in", "tokens_out",
+    "wall_clock_s", "termination", "patch_path", "modified_tests",
+    "trajectory_path", "run_date", "operator", "notes",
+)
+
+HARNESS_NAME = "claude-code"
+
+
+def patch_touches_tests(patch: str) -> bool:
+    """True if any file in the diff is a test file.
+
+    Should be False on every kept patch -- extract_patch reverts test edits
+    before diffing -- so this is a check on that filter, not a description of
+    what the agent tried to do. What it tried is in meta's `reverted_tests`.
+    """
+    for line in patch.splitlines():
+        if not line.startswith("diff --git "):
+            continue
+        for path in line.split()[2:]:
+            if TEST_PATH_RE.search(path.split("/", 1)[-1] if "/" in path else path):
+                return True
+    return False
+
+
+def run_log_record(meta: dict, args, patch: str, patch_path, trajectory_path) -> dict:
+    """One line of --runs_log, built from what the run already recorded."""
+    result = meta.get("claude_result") or {}
+    usage = result.get("usage") or {}
+    # Every input token the run consumed. `input_tokens` alone is misleading by
+    # orders of magnitude on an agentic run -- xarray's pilot billed 396 there
+    # against 36.9M cache reads. The unsummed breakdown stays in meta.
+    tokens_in = None
+    if usage:
+        tokens_in = sum(usage.get(k) or 0 for k in (
+            "input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens"))
+    return {
+        "issue_id": meta.get("instance_id"),
+        "arm": meta.get("arm"),
+        "model_id": args.model,
+        "harness": HARNESS_NAME,
+        "harness_version": meta.get("claude_version"),
+        "effort": args.effort,
+        "max_turns": args.max_turns,
+        "max_wall_clock_s": args.timeout,
+        "turns_used": meta.get("turns"),
+        "tokens_in": tokens_in,
+        "tokens_out": usage.get("output_tokens"),
+        "wall_clock_s": meta.get("duration_s"),
+        "termination": termination_for(meta.get("status", "error")),
+        "patch_path": str(patch_path) if patch_path else None,
+        "modified_tests": patch_touches_tests(patch or ""),
+        "trajectory_path": str(trajectory_path) if trajectory_path else None,
+        "run_date": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "operator": args.operator,
+        "notes": args.notes,
+    }
+
+
 def partial_stem(stem: str) -> str:
     """Name the partial file after the predictions file it shadows.
 
@@ -1359,16 +1818,26 @@ def partial_stem(stem: str) -> str:
     return stem + "_partial"
 
 
-def run_paths(out_path: Path, run_idx: int, num_runs: int):
-    """One predictions file per run: run_evaluation.py keys predictions by
-    instance_id, so duplicate ids in a single file silently overwrite."""
-    if num_runs == 1:
-        preds = out_path
-    else:
-        preds = out_path.with_name(f"{out_path.stem}_run{run_idx}{out_path.suffix}")
+def run_paths(out_path: Path, run_idx: int, num_runs: int, arm: str = "no-hint"):
+    """One predictions file per run *and* per arm.
+
+    run_evaluation.py keys predictions by instance_id, so duplicate ids in a
+    single file silently overwrite -- and the two arms run the same instance
+    ids by design, so the arm has to be in the name or the second sweep would
+    quietly erase the first.
+    """
+    def named(stem: str) -> Path:
+        if num_runs > 1:
+            stem = f"{stem}_run{run_idx}"
+        return out_path.with_name(f"{stem}_{arm}{out_path.suffix}")
+
+    # partial_stem is applied to the original stem, before the run and arm
+    # suffixes, so the partial file keeps the `_partial_preds` spelling rather
+    # than trailing the marker after everything else.
+    preds = named(out_path.stem)
+    partial = named(partial_stem(out_path.stem))
     meta = preds.with_name(preds.stem + "_meta.jsonl")
     prov = preds.with_name(preds.stem + "_provenance.jsonl")
-    partial = preds.with_name(partial_stem(preds.stem) + preds.suffix)
     return preds, meta, prov, partial
 
 
@@ -1425,9 +1894,11 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
                 cli_cache, manifest):
     """Run one sweep, one container at a time. Returns (counts, hit_usage_limit)."""
     preds_path, meta_path, prov_path, partial_path = run_paths(
-        out_path, run_idx, args.num_runs)
+        out_path, run_idx, args.num_runs, args.arm)
     log_dir = log_root / f"run{run_idx}"
     log_dir.mkdir(parents=True, exist_ok=True)
+    runs_log = Path(args.runs_log).resolve()
+    runs_log.parent.mkdir(parents=True, exist_ok=True)
 
     todo = list(instances)
     if args.resume:
@@ -1438,7 +1909,7 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
         print(f"[run {run_idx}] nothing to do")
         return {}, False
 
-    prompts = {i["instance_id"]: build_prompt(i) for i in todo}
+    prompts = {i["instance_id"]: build_prompt(i, args.arm, args.hints) for i in todo}
 
     # Provenance is appended, not overwritten, so a CLI upgrade partway through
     # a resumed run stays visible in the record.
@@ -1463,12 +1934,17 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
             "model_name_or_path": args.model_name,
             "allowed_tools": ALLOWED_TOOLS,
             "disallowed_tools": DISALLOWED_TOOLS,
+            "network_mode": NETWORK_MODE,
+            "egress_allow_hosts": list(EGRESS_ALLOW_HOSTS),
+            "egress_deny_probes": list(EGRESS_DENY_PROBES),
+            "nonessential_traffic_disabled": True,
             "max_turns": args.max_turns,
-            "prompt_style": PROMPT_STYLE,
+            "arm": args.arm,
+            "prompt_style": prompt_style_for(args.arm),
             "prompt_source_field": "problem_statement_realistic",
             # Kept a plain string for analysis/provenance_audit.py, which
             # compares this field against a single hash.
-            "prompt_sha256": sha256_16(VERBATIM_TEMPLATE),
+            "prompt_sha256": sha256_16(prompt_template_for(args.arm)),
             "prompt_sha256_by_instance": {
                 iid: hashlib.sha256(p.encode()).hexdigest() for iid, p in prompts.items()
             },
@@ -1499,6 +1975,14 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
                 append_jsonl(partial_path, record)
                 wrote_partial = True
             meta_f.write(json.dumps(meta) + "\n"); meta_f.flush()
+
+            patch_path = (preds_path if earns_a_prediction(status) and record
+                          else partial_path if wrote_partial else None)
+            append_jsonl(runs_log, run_log_record(
+                meta, args,
+                (record or {}).get("model_patch", ""),
+                patch_path, log_dir / f"{iid}.jsonl",
+            ))
 
             note = (f" (reverted {len(meta['reverted_tests'])} test file(s))"
                     if meta["reverted_tests"] else "")
@@ -1588,26 +2072,45 @@ def main():
                    help="REQUIRED full model ID passed to the claude CLI "
                         "(e.g. claude-opus-5); required so the model can never "
                         "change silently between runs")
-    p.add_argument("--effort", default="xhigh",
+    p.add_argument("--effort", default="high",
                    choices=("low", "medium", "high", "xhigh", "max"),
-                   help="--effort passed to the claude CLI (default: xhigh)")
-    p.add_argument("--max_turns", type=int, default=100,
+                   help="--effort passed to the claude CLI (default: high)")
+    p.add_argument("--max_turns", type=int, default=2000,
                    help="--max-turns passed to the claude CLI (agentic turn cap)")
     p.add_argument("--num_runs", type=int, default=1,
                    help="repeat the whole sweep N times; each instance gets a fresh "
                         "container and a fresh claude process, and its own predictions file")
+    p.add_argument("--arm", required=True, choices=ARMS,
+                   help="REQUIRED pilot arm. `no-hint` sends the issue text and the "
+                        "constraint block; `hinted` adds one line naming the file and "
+                        "method(s) the developer's fix touched. The arm is recorded in "
+                        "meta and in every output filename, so the two never overwrite "
+                        "each other.")
+    p.add_argument("--hints_file", default=None,
+                   help="JSON object, instance_id -> {\"file\": ..., \"methods\": [...]}; "
+                        "required by --arm hinted, and every hinted instance must have "
+                        "an entry")
+    p.add_argument("--operator", required=True,
+                   help="REQUIRED initials of whoever started the run, recorded on "
+                        "every run-log line")
+    p.add_argument("--notes", default="",
+                   help="free text copied to the run log's `notes` field")
+    p.add_argument("--runs_log", default=str(REPO_ROOT / "data" / "interim" / "pilot_runs.jsonl"),
+                   help="JSONL appended to, one line per instance run")
     p.add_argument("--instance_ids", nargs="*", default=None)
     p.add_argument("--limit", type=int, default=None, help="only the first N instances")
-    p.add_argument("--timeout", type=int, default=1800,
+    p.add_argument("--timeout", type=int, default=10800,
                    help="per-instance wall clock for the claude run (s)")
     p.add_argument("--run_id", default="claudegen",
                    help="suffix for container names, so a stale container is easy to spot")
     p.add_argument("--cli_cache", default=DEFAULT_CLI_CACHE,
                    help="host directory holding the Linux x86-64 Claude Code install "
                         "that every container mounts read-only")
-    p.add_argument("--cli_version", default="latest",
-                   help="npm version spec for @anthropic-ai/claude-code in the cache; "
-                        "the resolved version is recorded in provenance")
+    p.add_argument("--cli_version", required=True,
+                   help="REQUIRED exact npm version of @anthropic-ai/claude-code for "
+                        "the cache (e.g. 2.1.283); required rather than defaulting to "
+                        "`latest` so the harness version is pinned per run and cannot "
+                        "drift between arms. The resolved version goes in provenance.")
     p.add_argument("--bootstrap_cli", action="store_true",
                    help="rebuild the CLI cache even if it already exists")
     p.add_argument("--bootstrap_image", default=None,
@@ -1632,6 +2135,12 @@ def main():
         sys.exit("error: --num_runs must be at least 1")
     if args.max_turns < 1:
         sys.exit("error: --max_turns must be at least 1")
+    if args.arm == "hinted" and not args.hints_file:
+        sys.exit("error: --arm hinted needs --hints_file")
+    if args.arm == "no-hint" and args.hints_file:
+        sys.exit("error: --hints_file is meaningless with --arm no-hint; "
+                 "it would not be read, and passing it suggests the wrong arm")
+    args.hints = load_hints(args.hints_file)
 
     token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
     if not token:
@@ -1663,6 +2172,16 @@ def main():
     if not instances:
         sys.exit("error: no instances selected")
 
+    # Fail before the first image pull, not three hours in: an instance with no
+    # hint cannot run on this arm, and finding that out per-instance would mean
+    # a half-finished sweep.
+    if args.arm == "hinted":
+        try:
+            for inst in instances:
+                build_prompt(inst, args.arm, args.hints)
+        except KeyError as exc:
+            sys.exit(f"error: {exc.args[0]}")
+
     if args.wait_for_timed_path:
         wait_for_timed_path()
 
@@ -1678,28 +2197,37 @@ def main():
         return
 
     print(f"[env] claude (in container): {manifest.get('claude_version')}, "
-          f"model: {args.model}, effort: {args.effort}")
+          f"model: {args.model}, effort: {args.effort}, arm: {args.arm}")
+
+    net_name, proxy_name = egress_names(args.run_id)
+    network, proxy = start_egress(client, bootstrap_image, args.run_id)
+    print(f"[net] {NETWORK_MODE}: {net_name}, egress allowed only to "
+          f"{', '.join(EGRESS_ALLOW_HOSTS)} via {proxy_name}")
 
     totals, stopped = {}, None
-    for run_idx in range(1, args.num_runs + 1):
-        counts, stop_reason = execute_run(run_idx, instances, args, out_path,
-                                          log_root, client, token, cli_cache, manifest)
-        for k, v in counts.items():
-            totals[k] = totals.get(k, 0) + v
-        if stop_reason:
-            stopped = stop_reason
-            break
+    try:
+        for run_idx in range(1, args.num_runs + 1):
+            counts, stop_reason = execute_run(run_idx, instances, args, out_path,
+                                              log_root, client, token, cli_cache, manifest)
+            for k, v in counts.items():
+                totals[k] = totals.get(k, 0) + v
+            if stop_reason:
+                stopped = stop_reason
+                break
+    finally:
+        stop_egress(client, network, proxy)
 
     print("\nsummary across all runs: " +
           (", ".join(f"{k}={v}" for k, v in sorted(totals.items())) or "nothing run"))
     for run_idx in range(1, args.num_runs + 1):
-        preds, meta, _, partial = run_paths(out_path, run_idx, args.num_runs)
+        preds, meta, _, partial = run_paths(out_path, run_idx, args.num_runs, args.arm)
         if preds.exists():
             print(f"  run {run_idx}: {preds}  (metadata: {meta.name})")
         if partial.exists():
             print(f"  run {run_idx}: partial patches from cut-off runs "
                   f"(not predictions): {partial}")
     print(f"logs: {log_root}")
+    print(f"run log: {Path(args.runs_log).resolve()}")
     if stopped == "auth_failed":
         print("\nSTOPPED: the Claude API rejected the credential (401/403). "
               "CLAUDE_CODE_OAUTH_TOKEN is set but not valid -- it has expired, "
