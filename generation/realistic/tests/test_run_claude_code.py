@@ -6,6 +6,7 @@ cases (a test edit, a recompiled extension, a scratch file at the repo root, a
 checkout that still has history) can be exercised as strings.
 """
 
+import json
 import sys
 from pathlib import Path
 
@@ -20,6 +21,7 @@ from run_claude_code import (
     is_scratch, looks_like_usage_limit, parse_baseline_report, parse_markers,
     parse_numstat_binaries, parse_porcelain_z, redact, remote_image_key,
     verify_cli_capabilities, verify_hidden_flags,
+    classify_claude_failure, earns_a_prediction, parse_result_line,
 )
 
 
@@ -451,3 +453,73 @@ class TestHiddenFlagCheck:
     def test_a_missing_control_is_reported_as_a_probe_that_did_not_run(self):
         problems = verify_hidden_flags({"flag_max_turns": "10", "grep_control": ""})
         assert len(problems) == 1 and "did not run" in problems[0]
+
+
+class TestFailureClassification:
+    """An expired token, a 429 and a genuine crash all exit non-zero with an
+    empty diff. Only the last says anything about the model, so they must not
+    share a status -- the first pilot run recorded three 401s as three
+    legitimate "the model changed nothing" predictions."""
+
+    AUTH_RESULT = {
+        "is_error": True, "api_error_status": 401, "terminal_reason": "api_error",
+        "result_text": "Failed to authenticate. API Error: 401 OAuth access token is invalid.",
+    }
+
+    def test_401_is_an_auth_failure(self):
+        assert classify_claude_failure(1, self.AUTH_RESULT, "") == "auth_failed"
+
+    def test_403_is_an_auth_failure(self):
+        assert classify_claude_failure(1, {"api_error_status": 403}, "") == "auth_failed"
+
+    def test_auth_failure_is_recognised_from_stderr_alone(self):
+        assert classify_claude_failure(1, None, "authentication_failed") == "auth_failed"
+
+    def test_429_is_a_usage_limit(self):
+        assert classify_claude_failure(1, {"api_error_status": 429}, "") == "usage_limit"
+
+    def test_other_api_errors_are_their_own_status(self):
+        result = {"api_error_status": 500, "terminal_reason": "api_error"}
+        assert classify_claude_failure(1, result, "") == "api_error"
+
+    def test_a_plain_crash_keeps_the_exit_code(self):
+        assert classify_claude_failure(2, None, "segfault") == "claude_exit_2"
+
+    def test_token_counts_are_not_mistaken_for_status_codes(self):
+        # The result blob carries usage numbers; a bare \b401\b regex over the
+        # whole JSON would match "input_tokens": 401 and call a good run an
+        # auth failure.
+        result = {"usage": {"input_tokens": 401, "output_tokens": 403},
+                  "result_text": "done, made core.py faster"}
+        assert classify_claude_failure(1, result, "") == "claude_exit_1"
+
+
+class TestWhatEarnsAPrediction:
+    def test_a_clean_run_is_recorded(self):
+        assert earns_a_prediction("ok")
+
+    def test_a_deliberate_no_change_is_recorded(self):
+        # The agent ran to completion and chose to change nothing; that is a
+        # real result, not a failure.
+        assert earns_a_prediction("empty_patch")
+
+    @pytest.mark.parametrize("status", [
+        "auth_failed", "api_error", "usage_limit", "timeout", "error",
+        "setup_failed", "cancelled", "claude_exit_1", "claude_exit_2",
+    ])
+    def test_nothing_else_is_recorded(self, status):
+        assert not earns_a_prediction(status)
+
+    def test_an_unknown_status_defaults_to_not_recorded(self):
+        # An allow-list, so a status added later cannot silently become data.
+        assert not earns_a_prediction("some_future_status")
+
+
+class TestResultLineKeepsErrorFields:
+    def test_api_error_fields_survive_parsing(self):
+        line = json.dumps({"type": "result", "is_error": True,
+                           "api_error_status": 401, "terminal_reason": "api_error",
+                           "result": "Failed to authenticate.", "num_turns": 1})
+        parsed = parse_result_line(line)
+        assert parsed["api_error_status"] == 401
+        assert parsed["terminal_reason"] == "api_error"

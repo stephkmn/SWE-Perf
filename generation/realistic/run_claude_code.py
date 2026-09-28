@@ -134,11 +134,50 @@ USAGE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
-# Statuses that must NOT get a prediction line: leaving them out of the
-# predictions file is what makes --resume pick them up again.
-RETRY_STATUSES = ("error", "usage_limit", "cancelled", "timeout", "setup_failed")
-# "timeout" is here deliberately: a killed run leaves a mid-edit working tree,
-# and that truncated diff is a wrong data point, not a slow one.
+# The ONLY statuses that earn a prediction line. Everything else is treated as
+# unfinished work, left out of the predictions file, and picked up again by
+# --resume. An allow-list rather than a deny-list on purpose: the first pilot
+# run hit a 401, which exits 1 with an empty diff, and a deny-list recorded
+# that as three legitimate "the model changed nothing" results. Any outcome we
+# have not explicitly decided is trustworthy must not become a data point.
+#
+# "empty_patch" is kept because it IS a real result: the agent ran to
+# completion and chose to change nothing. "timeout" is not, because a killed
+# run leaves a mid-edit tree, and that truncated diff is a wrong data point
+# rather than a slow one.
+KEEP_STATUSES = ("ok", "empty_patch")
+
+
+def earns_a_prediction(status: str) -> bool:
+    return status in KEEP_STATUSES
+
+
+# Matched against the agent's own error text, never against the whole result
+# JSON: that blob carries token counts, and a bare \b401\b would happily match
+# "input_tokens": 401.
+AUTH_ERROR_RE = re.compile(
+    r"authentication_failed|oauth access token is invalid|"
+    r"oauth token is invalid|invalid[_ ]api[_ ]key|unauthorized",
+    re.IGNORECASE,
+)
+
+
+def classify_claude_failure(rc, result, stderr) -> str:
+    """Name the failure, so an infrastructure fault is never a model result.
+
+    An expired token, a 429 and a genuine agent crash all exit non-zero with
+    an empty diff; only the last of those says anything about the model.
+    """
+    result = result or {}
+    code = result.get("api_error_status")
+    text = " ".join(x for x in (result.get("result_text", ""), stderr or "") if x)
+    if code in (401, 403) or AUTH_ERROR_RE.search(text):
+        return "auth_failed"
+    if code == 429 or looks_like_usage_limit(text):
+        return "usage_limit"
+    if code or result.get("terminal_reason") == "api_error":
+        return "api_error"
+    return f"claude_exit_{rc}"
 
 
 # --------------------------------------------------------------------------
@@ -366,7 +405,8 @@ def sha256_16(text: str) -> str:
 
 def parse_result_line(stdout: str) -> Optional[dict]:
     """Pull the fields we care about out of the stream's final `result` message."""
-    keep = ("num_turns", "total_cost_usd", "usage", "duration_ms", "is_error", "subtype")
+    keep = ("num_turns", "total_cost_usd", "usage", "duration_ms", "is_error",
+            "subtype", "api_error_status", "terminal_reason")
     for line in reversed(stdout.splitlines()):
         line = line.strip()
         if not line.startswith("{"):
@@ -1193,12 +1233,8 @@ def process(inst, args, client, log_dir, run_idx, token, cli_cache):
 
         if err_text:
             meta["status"] = "timeout"
-        elif rc != 0:
-            result_text = json.dumps(result) if result else ""
-            if looks_like_usage_limit(stderr, result_text):
-                meta["status"] = "usage_limit"
-            else:
-                meta["status"] = f"claude_exit_{rc}"
+        elif rc != 0 or (result or {}).get("is_error"):
+            meta["status"] = classify_claude_failure(rc, result, stderr)
 
         patch = extract_patch(container, meta, agent_env)
         if not patch.strip() and meta["status"] == "ok":
@@ -1351,16 +1387,16 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
           f"one container at a time -> {preds_path}")
 
     counts = {}
-    hit_limit = False
+    stop_reason = None
     with open(preds_path, "a") as out_f, open(meta_path, "a") as meta_f:
         for n, inst in enumerate(todo, 1):
             record, meta, iid = process(inst, args, client, log_dir, run_idx,
                                         token, cli_cache)
             status = meta["status"]
             counts[status] = counts.get(status, 0) + 1
-            # error/usage_limit get a meta line but no prediction, so that a
-            # later --resume treats them as unfinished and retries them.
-            if status not in RETRY_STATUSES and record is not None:
+            # Anything that did not run cleanly gets a meta line but no
+            # prediction, so a later --resume treats it as unfinished.
+            if earns_a_prediction(status) and record is not None:
                 out_f.write(json.dumps(record) + "\n"); out_f.flush()
             meta_f.write(json.dumps(meta) + "\n"); meta_f.flush()
 
@@ -1376,14 +1412,23 @@ def execute_run(run_idx, instances, args, out_path, log_root, client, token,
                   f"{status}, {meta.get('files_changed', 0)} file(s), "
                   f"{meta['duration_s']}s{note}")
 
-            if status == "usage_limit" and args.stop_on_limit:
-                hit_limit = True
+            # A bad credential fails every instance identically, so there is
+            # nothing to learn from spending a container on each of the rest.
+            # This one is not optional: unlike a usage limit, waiting does not
+            # fix it.
+            if status == "auth_failed":
+                stop_reason = "auth_failed"
+            elif status == "usage_limit" and args.stop_on_limit:
+                stop_reason = "usage_limit"
+            if stop_reason:
                 remaining = len(todo) - n
                 counts["cancelled"] = counts.get("cancelled", 0) + remaining
-                print(f"  [run {run_idx}] usage limit hit -- stopping with "
+                label = ("authentication failed" if stop_reason == "auth_failed"
+                         else "usage limit hit")
+                print(f"  [run {run_idx}] {label} -- stopping with "
                       f"{remaining} instance(s) not started")
                 break
-    return counts, hit_limit
+    return counts, stop_reason
 
 
 TIMED_PATH_PATTERN = r"[t]imed_path\.py"
@@ -1525,14 +1570,14 @@ def main():
     print(f"[env] claude (in container): {manifest.get('claude_version')}, "
           f"model: {args.model}, effort: {args.effort}")
 
-    totals, stopped = {}, False
+    totals, stopped = {}, None
     for run_idx in range(1, args.num_runs + 1):
-        counts, hit_limit = execute_run(run_idx, instances, args, out_path,
-                                        log_root, client, token, cli_cache, manifest)
+        counts, stop_reason = execute_run(run_idx, instances, args, out_path,
+                                          log_root, client, token, cli_cache, manifest)
         for k, v in counts.items():
             totals[k] = totals.get(k, 0) + v
-        if hit_limit:
-            stopped = True
+        if stop_reason:
+            stopped = stop_reason
             break
 
     print("\nsummary across all runs: " +
@@ -1542,7 +1587,15 @@ def main():
         if preds.exists():
             print(f"  run {run_idx}: {preds}  (metadata: {meta.name})")
     print(f"logs: {log_root}")
-    if stopped:
+    if stopped == "auth_failed":
+        print("\nSTOPPED: the Claude API rejected the credential (401/403). "
+              "CLAUDE_CODE_OAUTH_TOKEN is set but not valid -- it has expired, "
+              "been revoked, or was copied incompletely.\n"
+              "Mint a fresh one with `claude setup-token`, export it, and rerun "
+              "this same command with --resume.\n"
+              "No prediction was written for any affected instance, so nothing "
+              "has to be cleaned up first.")
+    elif stopped == "usage_limit":
         print("\nSTOPPED: hit a Claude usage/rate limit. No prediction was written "
               "for the affected or unstarted instances, so rerun this same command "
               "later with --resume to pick them up.")
