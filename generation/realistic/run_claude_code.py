@@ -1,39 +1,100 @@
 #!/usr/bin/env python3
 """
-Generate SWE-Perf patches with Claude Code (realistic setting).
+Generate SWE-Perf patches with Claude Code, inside the benchmark's own images.
 
-For each dataset instance this script materializes the repo at its base commit
-onto the host, runs headless Claude Code inside that checkout, and captures the
-resulting `git diff` as the instance's `model_patch`.
+For each dataset instance this script starts a fresh container from the same
+image the evaluation harness runs (docker.io/betty1202/sweb.eval.x86_64.<id>),
+runs headless Claude Code inside it as a non-root user with the instance's
+conda environment already active, and captures the resulting `git diff` as the
+instance's `model_patch`.
 
-The checkout contains exactly one commit (the base tree, re-committed into a
-fresh repository): no history, no tags, no remotes. Claude therefore cannot
-read the future of the repo, and the diff is always taken against the base.
+Running inside the image is the whole point: /testbed there is the repo *after*
+the instance's install step, with every dependency present, so the agent can
+import the package, run pytest, and measure what it changed. The previous
+host-checkout mode could do none of that and has been removed.
+
+Isolation: before Claude starts, /testbed is reduced to a single commit -- the
+post-setup tree exactly as the image ships it, re-committed into a brand-new
+repository. No earlier or later history, no tags, no remotes, no reflog. The
+agent therefore cannot read the upstream fix, and the extracted diff contains
+only its own changes while still applying cleanly on a fresh eval container.
 
 Output is a JSONL file in the format expected by evaluation/run_evaluation.py:
 
     {"instance_id": ..., "model_name_or_path": ..., "model_patch": ...}
 
-Authentication uses the Claude Code CLI's own login (subscription). Any
-ANTHROPIC_API_KEY in the environment is deliberately stripped so runs never
-fall through to per-token API billing.
+Authentication is CLAUDE_CODE_OAUTH_TOKEN from the host environment, handed to
+the container as an exec-time environment variable only. It is never written to
+disk, an image, a log, a transcript, or the provenance record, and it is
+redacted out of captured output before anything is saved.
 """
+
+from __future__ import annotations
 
 import argparse
 import hashlib
+import io
 import json
+import logging
 import os
 import re
-import shutil
 import subprocess
 import sys
+import tarfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT / "evaluation"))
+
+import docker  # noqa: E402
+import docker.errors  # noqa: E402
+
+from constants import MAP_REPO_VERSION_TO_SPECS  # noqa: E402
+from docker_build import LOCAL_MAX_MEM_LIMIT, LOCAL_MAX_NANO_CPUS, USE_HOST_NETWORK  # noqa: E402
+from docker_utils import cleanup_container  # noqa: E402
+from test_spec import make_test_spec  # noqa: E402
+
 PROMPT_HASH_LEN = 16
+
+# run_evaluation.py rewrites every instance image key to the published x86_64
+# images under this prefix rather than building locally. Mirror it exactly so
+# generation and evaluation see the same /testbed.
+DOCKER_IMAGE_PREFIX = "docker.io/betty1202/"
+IMAGE_TEMPLATE = DOCKER_IMAGE_PREFIX + "sweb.eval.x86_64.<instance_id>"
+
+REPO_DIR = "/testbed"
+# Created by the benchmark's own base image (`adduser ... nonroot`). Claude
+# needs a non-root user: --dangerously-skip-permissions refuses to run as root.
+AGENT_USER = "nonroot"
+AGENT_HOME = "/home/nonroot"
+CONDA_ROOT = "/opt/miniconda3"
+
+# Read-only bind mount holding a Linux x86-64 Claude Code install, built once
+# by --bootstrap_cli and reused by every instance. See bootstrap_cli().
+CLI_MOUNT = "/opt/claude-cli"
+CLI_BIN = f"{CLI_MOUNT}/npm/bin/claude"
+CLI_NODE_BIN = f"{CLI_MOUNT}/node/bin"
+
+# Node is a *bootstrap-time* dependency only: the npm package's postinstall
+# swaps the platform's native binary over bin/claude.exe, after which `claude`
+# execs that binary directly and no Node process is involved. Pinned so the
+# cache is reproducible; the resolved versions land in the manifest.
+NODE_VERSION = "22.23.3"
+NODE_TARBALL = f"https://nodejs.org/dist/v{NODE_VERSION}/node-v{NODE_VERSION}-linux-x64.tar.gz"
+CLI_NPM_PACKAGE = "@anthropic-ai/claude-code"
+MANIFEST_NAME = "MANIFEST.json"
+
+# Anchored to the repo, not the working directory: these used to be written
+# "../../datasets/...", which only lands inside the repo when the script is run
+# from generation/realistic and silently writes to the parent of the checkout
+# otherwise. An explicit --output or --cli_cache is still taken as given.
+DEFAULT_OUTPUT = str(REPO_ROOT / "datasets" / "outputs" / "claude_code_preds.jsonl")
+DEFAULT_CLI_CACHE = str(REPO_ROOT / "datasets" / "claude_cli_linux_x64")
+
+MARKER = "SWEPERF::"
 
 ALLOWED_TOOLS = ["Edit", "Read", "Write", "Glob", "Grep", "Bash"]
 
@@ -45,37 +106,26 @@ DISALLOWED_TOOLS = ["WebFetch", "WebSearch", "Bash(curl:*)", "Bash(wget:*)"]
 # probed for network access or repo history. Matched case-insensitively.
 AUDIT_PATTERNS = ["http://", "https://", "github.com", "git log --all", "pip download"]
 
-# NOTE: "custom" deliberately deviates from the benchmark's own wording. SWE-Perf
-# builds its prompt in generation/oracle/make_datasets/create_text_dataset.py and
-# states its four optimization rules there; this template restates those rules in
-# our own words and adds the "no dependencies installed" caveat, which is a
-# property of our host-checkout setting rather than of the benchmark. Use
-# --prompt_style verbatim to send problem_statement_realistic untouched instead,
-# which is the apples-to-apples comparison against published SWE-Perf numbers.
-PROMPT_TEMPLATE = """You are optimizing this repository for runtime performance.
-
-Rules:
-1. Do NOT modify, add, or delete any unit tests. Existing tests must remain unaltered.
-2. Preserve the exact behavior and public API of every function you touch.
-3. Prioritize maximal efficiency gains where feasible.
-4. Make your changes directly in the working tree by editing files.
-
-Note: this checkout does NOT have the project's dependencies installed, so you
-generally cannot import the package or run its test suite. Read the code and
-reason about complexity and allocation instead.
-
-Task:
-{problem_statement}
-"""
-
-# --prompt_style verbatim: the problem statement is passed through untouched,
-# because problem_statement_realistic already carries the benchmark's own rules.
+# problem_statement_realistic already carries the benchmark's own four rules, so
+# it is sent untouched. This is the apples-to-apples comparison against
+# published SWE-Perf numbers, and it is now the only supported prompt.
 VERBATIM_TEMPLATE = "{problem_statement}"
+PROMPT_STYLE = "verbatim"
 
 # Intentionally does NOT match `testing/`: that is library code in several of the
 # benchmark repos (e.g. xarray/testing/assertions.py), not a test suite.
 TEST_PATH_RE = re.compile(
     r"(^|/)tests?/|(^|/)test_[^/]*\.py$|_test\.py$|(^|/)conftest\.py$"
+)
+
+# Build output. Unlike the host-checkout setting, /testbed arrives already
+# built, so these files exist in the baseline and Claude re-running the build
+# (or merely importing the package) dirties them. None of it belongs in a patch.
+BUILD_ARTIFACT_RE = re.compile(
+    r"(^|/)__pycache__/|\.py[co]$|"
+    r"\.(so|pyd|o|a|dylib)(\.[\w.]+)?$|"
+    r"(^|/)build/|(^|/)\.eggs/|\.egg-info(/|$)|"
+    r"(^|/)\.pytest_cache/|(^|/)\.hypothesis/|(^|/)\.mypy_cache/|(^|/)\.coverage$"
 )
 
 USAGE_LIMIT_RE = re.compile(
@@ -84,110 +134,43 @@ USAGE_LIMIT_RE = re.compile(
     re.IGNORECASE,
 )
 
-_mirror_locks: dict = {}
-_mirror_locks_guard = threading.Lock()
-_write_lock = threading.Lock()
+# Statuses that must NOT get a prediction line: leaving them out of the
+# predictions file is what makes --resume pick them up again.
+RETRY_STATUSES = ("error", "usage_limit", "cancelled", "timeout", "setup_failed")
+# "timeout" is here deliberately: a killed run leaves a mid-edit working tree,
+# and that truncated diff is a wrong data point, not a slow one.
 
 
-def git(args, cwd=None, check=True):
-    """Run a git command and return stdout."""
-    proc = subprocess.run(
-        ["git"] + args, cwd=cwd, check=False,
-        capture_output=True, text=True,
-    )
-    if check and proc.returncode != 0:
-        raise RuntimeError(f"git {' '.join(args)} failed: {proc.stderr.strip()}")
-    return proc.stdout
+# --------------------------------------------------------------------------
+# pure helpers (no Docker, no Claude -- these are what the unit tests cover)
+# --------------------------------------------------------------------------
+
+def remote_image_key(instance_id: str) -> str:
+    """The published evaluation image for an instance."""
+    return (DOCKER_IMAGE_PREFIX + "sweb.eval.x86_64."
+            + instance_id.replace("__", "_s_")).lower()
 
 
-def mirror_lock(repo):
-    with _mirror_locks_guard:
-        return _mirror_locks.setdefault(repo, threading.Lock())
+def parse_markers(text: str, marker: str = MARKER) -> dict:
+    """Collect `MARKERkey=value` lines out of a container's output."""
+    found = {}
+    for line in text.splitlines():
+        line = line.strip()
+        idx = line.find(marker)
+        if idx < 0:
+            continue
+        payload = line[idx + len(marker):].strip()
+        if "=" in payload:
+            key, value = payload.split("=", 1)
+            found[key.strip()] = value.strip()
+    return found
 
 
-def ensure_mirror(repo, cache_dir, base_commit):
-    """Maintain one bare mirror per repo so each instance is built locally."""
-    mirror = cache_dir / (repo.replace("/", "__") + ".git")
-    with mirror_lock(repo):
-        if not mirror.exists():
-            print(f"[cache] cloning mirror for {repo} (one time, may be large)")
-            git(["clone", "--bare", f"https://github.com/{repo}.git", str(mirror)])
-        have = subprocess.run(
-            ["git", "-C", str(mirror), "cat-file", "-e", f"{base_commit}^{{commit}}"],
-            capture_output=True,
-        ).returncode == 0
-        if not have:
-            print(f"[cache] fetching {base_commit[:8]} into {repo} mirror")
-            git(["-C", str(mirror), "fetch", "--tags", "origin",
-                 "+refs/heads/*:refs/heads/*"])
-    return mirror
-
-
-def prepare_checkout(repo, base_commit, mirror, dest):
-    """Materialize ONLY the base commit's tree in a brand-new repository.
-
-    `git clone` would drag along every commit, tag and remote of the mirror, so
-    a capable agent could simply read the upstream optimization out of the future
-    history. Instead the base tree is exported with `git archive`, unpacked into
-    an empty directory, and committed once into a fresh `git init`. The result
-    has one commit, no tags, no remotes, and no path back to the mirror.
-    """
-    if dest.exists():
-        shutil.rmtree(dest)
-    dest.mkdir(parents=True)
-
-    # git archive <commit> | tar -x -C <dest>
-    archive = subprocess.Popen(
-        ["git", "-C", str(mirror), "archive", base_commit],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    untar = subprocess.Popen(
-        ["tar", "-x", "-C", str(dest)],
-        stdin=archive.stdout, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-    )
-    archive.stdout.close()  # let git see EPIPE if tar dies first
-    untar_err = untar.communicate()[1]
-    archive_err = archive.stderr.read()
-    archive.stderr.close()
-    archive.wait()
-    if archive.returncode != 0:
-        raise RuntimeError(
-            f"git archive {base_commit[:8]} failed: "
-            f"{archive_err.decode('utf-8', 'replace').strip()}"
-        )
-    if untar.returncode != 0:
-        raise RuntimeError(
-            f"tar -x failed for {base_commit[:8]}: "
-            f"{untar_err.decode('utf-8', 'replace').strip()}"
-        )
-
-    ident = ["-c", "user.name=base", "-c", "user.email=base@local",
-             "-c", "commit.gpgsign=false"]
-    git(["-c", "init.defaultBranch=main", "init", "-q", str(dest)])
-    # -f is required: `git archive` exports files that upstream tracks even when
-    # the repo's own .gitignore matches them. Without -f they land on disk but
-    # never enter the base commit, so any edit to them is silently dropped from
-    # the patch. extract_patch needs no -f: gitignore stops applying once a
-    # file is tracked.
-    git(["-C", str(dest)] + ident + ["add", "-A", "-f"])
-    git(["-C", str(dest)] + ident +
-        # the message stays a bare "base": writing the upstream SHA into the
-        # working copy would hand the agent an identifier for the real commit.
-        ["commit", "-q", "--no-verify", "-m", "base"])
-
-
-def scrub_artifacts(root: Path):
-    """Drop build noise Claude may have produced so it never reaches the diff."""
-    for pyc in root.rglob("*.pyc"):
-        pyc.unlink(missing_ok=True)
-    for cache in list(root.rglob("__pycache__")):
-        shutil.rmtree(cache, ignore_errors=True)
-
-
-def status_entries(dest: Path):
+def parse_porcelain_z(data) -> list:
     """Parse `git status --porcelain -z -uall` into (code, path) pairs."""
-    out = git(["-C", str(dest), "status", "--porcelain", "-z", "-uall"], check=False)
-    fields = out.split("\0")
+    if isinstance(data, bytes):
+        data = data.decode("utf-8", "replace")
+    fields = data.split("\0")
     entries, i = [], 0
     while i < len(fields):
         item = fields[i]
@@ -201,69 +184,184 @@ def status_entries(dest: Path):
     return entries
 
 
-def revert_test_edits(dest: Path):
-    """Undo any change to a test file; rule 1 forbids touching them."""
-    reverted = []
-    for code, path in status_entries(dest):
-        if not TEST_PATH_RE.search(path):
-            continue
-        reverted.append(path)
-        if code.strip() == "??":
-            target = dest / path
-            if target.is_dir():
-                shutil.rmtree(target, ignore_errors=True)
-            else:
-                target.unlink(missing_ok=True)
-        else:
-            git(["-C", str(dest), "checkout", "--", path], check=False)
-    return reverted
+def is_untracked(code: str) -> bool:
+    return code.strip() == "??"
 
 
-def clean_scratch_files(dest: Path):
-    """Remove Claude's scratch output before staging.
+def is_scratch(path: str) -> bool:
+    """`.DS_Store` anywhere, or a brand-new file dropped at the repo root.
 
-    `.DS_Store` anywhere and brand-new files at the repo root (where agents tend
-    to drop benchmark_foo.py / notes.md) are deleted. Every other new file is
-    left in the patch but reported so it can be reviewed.
+    Agents like to leave benchmark_foo.py / notes.md next to setup.py. Nothing
+    at the top level is part of an optimization, and a stray file there can
+    break the package build on the evaluation image.
     """
-    removed, new_files = [], []
-    for code, path in status_entries(dest):
-        if code.strip() != "??":
-            continue
-        target = dest / path
-        is_scratch = Path(path).name == ".DS_Store" or "/" not in path
-        if is_scratch:
-            if target.is_dir():
-                shutil.rmtree(target, ignore_errors=True)
-            else:
-                target.unlink(missing_ok=True)
-            removed.append(path)
+    return Path(path).name == ".DS_Store" or "/" not in path
+
+
+def classify_worktree(entries) -> dict:
+    """Decide what to do with every path `git status` reports.
+
+    Order matters: a change to `tests/` is reverted as a test edit even if it
+    also looks like build output, because rule 1 is the one being enforced.
+
+    Returns lists of paths under four keys -- `revert` (restore the baseline
+    copy), `remove` (delete an untracked file), `new_files` (untracked, kept in
+    the patch, reported for review) -- plus the reason each path was filtered,
+    so meta can say *why* something was dropped.
+    """
+    plan = {"revert": [], "remove": [], "new_files": [], "reasons": {}}
+
+    def drop(path, reason):
+        plan["reasons"][path] = reason
+
+    for code, path in entries:
+        untracked = is_untracked(code)
+        if TEST_PATH_RE.search(path):
+            reason = "test_file"
+        elif BUILD_ARTIFACT_RE.search(path):
+            reason = "build_artifact"
+        elif untracked and is_scratch(path):
+            reason = "scratch"
         else:
-            new_files.append(path)
-    return removed, new_files
+            if untracked:
+                plan["new_files"].append(path)
+            continue
+        drop(path, reason)
+        (plan["remove"] if untracked else plan["revert"]).append(path)
+    return plan
 
 
-def extract_patch(dest: Path):
-    """Stage everything and return the unified diff against the base commit."""
-    git(["-C", str(dest), "add", "-A"])
-    return git(["-C", str(dest), "diff", "--cached"], check=False)
+def filtered_by(plan: dict, reason: str) -> list:
+    """Paths the plan dropped for one reason, in the order they were seen."""
+    return [p for p in plan["revert"] + plan["remove"]
+            if plan["reasons"].get(p) == reason]
 
 
-def build_env():
-    """Inherit the user's shell env but force CLI (subscription) auth."""
-    env = os.environ.copy()
-    for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-        env.pop(key, None)
-    return env
+def parse_numstat_binaries(numstat: str) -> list:
+    """Paths `git diff --cached --numstat` reports as binary (`-  -  path`)."""
+    binaries = []
+    for line in numstat.splitlines():
+        parts = line.split("\t")
+        if len(parts) >= 3 and parts[0] == "-" and parts[1] == "-":
+            binaries.append(parts[-1])
+    return binaries
 
 
-def as_text(blob):
-    """TimeoutExpired.stdout is bytes or None even when text=True was asked for."""
-    if blob is None:
-        return ""
-    if isinstance(blob, bytes):
-        return blob.decode("utf-8", "replace")
-    return blob
+def build_baseline_script(repo_dir: str = REPO_DIR) -> str:
+    """Bash that turns /testbed into a repository with exactly one commit.
+
+    The tree is committed *as the image ships it*, after its setup step has
+    run. Several images leave /testbed dirty that way (astropy rewrites
+    pyproject.toml during install), and that state is what the evaluation
+    container will also have, so it is the only correct baseline: anything
+    else would put the image's own edits into the model's patch and make the
+    patch fail to apply at evaluation time.
+
+    `git add -A -f` is deliberate. Some repos track files their own .gitignore
+    matches (generated version modules, for one); without -f those land on
+    disk but never enter the baseline, so a later edit to them is silently
+    dropped from the diff. __pycache__ and .pyc are deleted first instead of
+    being committed, because they are pure churn that Python regenerates --
+    compiled extensions are NOT deleted, since the package needs them to
+    import, and they are filtered at extraction instead.
+    """
+    return "\n".join([
+        "set -e",
+        f"cd {repo_dir}",
+        "find . -name '__pycache__' -type d -prune -exec rm -rf {} + 2>/dev/null || true",
+        "find . -name '*.pyc' -delete 2>/dev/null || true",
+        "find . -name '*.pyo' -delete 2>/dev/null || true",
+        "rm -rf .git",
+        "git -c init.defaultBranch=main init -q .",
+        "git config user.name base",
+        "git config user.email base@local",
+        "git config commit.gpgsign false",
+        "git add -A -f",
+        # The message stays a bare "base": writing the upstream SHA into the
+        # working copy would hand the agent an identifier for the real commit.
+        "git commit -q --no-verify -m base",
+        # A fresh init has no prior history in its reflog by construction;
+        # dropping the log as well leaves literally nothing to walk back to.
+        "rm -rf .git/logs",
+    ])
+
+
+def build_verify_script(repo_dir: str = REPO_DIR) -> str:
+    """Bash that reports the isolation invariants for parse_baseline_report."""
+    return "\n".join([
+        f"cd {repo_dir}",
+        f"echo '{MARKER}commits='$(git log --all --oneline | wc -l | tr -d ' ')",
+        f"echo '{MARKER}tags='$(git tag | wc -l | tr -d ' ')",
+        f"echo '{MARKER}remotes='$(git remote | wc -l | tr -d ' ')",
+        f"echo '{MARKER}reflog='$(git reflog 2>/dev/null | wc -l | tr -d ' ')",
+        f"echo '{MARKER}dirty='$(git status --porcelain | wc -l | tr -d ' ')",
+        f"echo '{MARKER}head='$(git rev-parse HEAD)",
+        "git status --porcelain | head -20",
+    ])
+
+
+def parse_baseline_report(text: str) -> dict:
+    """Turn the verify script's marker lines into ints (and the HEAD sha)."""
+    raw = parse_markers(text)
+    report = {}
+    for key in ("commits", "tags", "remotes", "reflog", "dirty"):
+        try:
+            report[key] = int(raw[key])
+        except (KeyError, ValueError):
+            report[key] = None
+    report["head"] = raw.get("head")
+    return report
+
+
+def baseline_problems(report: dict) -> list:
+    """Everything wrong with the isolated checkout; empty means it is clean."""
+    problems = []
+    checks = [
+        ("commits", 1, "git log --all shows {got} commit(s), expected exactly 1"),
+        ("tags", 0, "{got} tag(s) present, expected none"),
+        ("remotes", 0, "{got} remote(s) present, expected none"),
+        ("reflog", 0, "{got} reflog entr(ies) present, expected none"),
+        ("dirty", 0, "{got} uncommitted path(s) in the baseline, expected none"),
+    ]
+    for key, expected, template in checks:
+        got = report.get(key)
+        if got is None:
+            problems.append(f"could not read `{key}` from the container")
+        elif got != expected:
+            problems.append(template.format(got=got))
+    if not report.get("head"):
+        problems.append("baseline commit has no HEAD")
+    return problems
+
+
+def redact(text, secret):
+    """Strip the OAuth token out of anything on its way to disk.
+
+    Nothing should print it, but a single `env` in the transcript would put a
+    live credential in the run's artifacts. Cheap insurance, applied to every
+    byte the script writes.
+    """
+    if not text:
+        return text or ""
+    if secret:
+        text = text.replace(secret, "<REDACTED_OAUTH_TOKEN>")
+    return text
+
+
+def problem_statement_for(inst):
+    for key in ("problem_statement_realistic", "problem_statement"):
+        if inst.get(key):
+            return inst[key]
+    raise KeyError(f"no problem statement on {inst['instance_id']}")
+
+
+def build_prompt(inst):
+    """The dataset's own text, verbatim, with nothing added."""
+    return VERBATIM_TEMPLATE.format(problem_statement=problem_statement_for(inst))
+
+
+def sha256_16(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:PROMPT_HASH_LEN]
 
 
 def parse_result_line(stdout: str) -> Optional[dict]:
@@ -333,70 +431,759 @@ def looks_like_usage_limit(*texts):
     return any(USAGE_LIMIT_RE.search(t) for t in texts if t)
 
 
-def run_claude(prompt, cwd, timeout, model, max_turns, log_dir, iid):
-    """Run headless Claude Code, saving the full stream-json transcript.
+def env_name_for(test_spec) -> str:
+    """The conda env the benchmark's own eval script activates.
 
-    Returns (returncode, timeout_error, claude_result, stdout, stderr). A
-    returncode of None means the process was killed by the timeout.
+    Same rule regression_check.py uses; duplicated rather than imported so the
+    generation driver depends only on evaluation/, never on analysis/.
     """
-    cmd = [
-        "claude", "-p", prompt,
+    match = re.search(r"conda activate (\S+)", test_spec.eval_script)
+    return match.group(1) if match else "testbed"
+
+
+def agent_environment(env_name: str, token: str = "") -> dict:
+    """Environment for every exec run as the agent user.
+
+    PATH puts the instance's conda env first so `python` and `pytest` resolve
+    to the packages the benchmark installed -- that is the whole reason for
+    running in the image, and it means the prompt never has to mention it.
+
+    HOME has to be stated explicitly rather than left to `docker exec -u`: git
+    reads its global config from $HOME, and the image's own environment points
+    at /root, which the agent user cannot read.
+
+    The token is added only when one is passed, so the setup and extraction
+    execs never carry a credential they have no use for.
+    """
+    conda_bin = f"{CONDA_ROOT}/envs/{env_name}/bin"
+    path = ":".join([
+        conda_bin,
+        f"{CONDA_ROOT}/condabin",
+        f"{CLI_MOUNT}/npm/bin",
+        CLI_NODE_BIN,
+        "/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin",
+    ])
+    env = {
+        "HOME": AGENT_HOME,
+        "USER": AGENT_USER,
+        "LOGNAME": AGENT_USER,
+        "SHELL": "/bin/bash",
+        "PATH": path,
+        "CONDA_PREFIX": f"{CONDA_ROOT}/envs/{env_name}",
+        "CONDA_DEFAULT_ENV": env_name,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "TERM": "dumb",
+        # Pins the run to the version recorded in provenance; the mount is
+        # read-only, so an update attempt would only produce noise anyway.
+        "DISABLE_AUTOUPDATER": "1",
+        "CLAUDE_CONFIG_DIR": f"{AGENT_HOME}/.claude",
+    }
+    if token:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+    return env
+
+
+def claude_command(prompt: str, model: str, effort: str, max_turns: int, timeout: int) -> list:
+    """argv for the in-container Claude run.
+
+    A list, not a shell string: the prompt is dataset text and must reach the
+    CLI byte-for-byte, with no quoting layer in between.
+
+    `env -u` rather than an empty value, so ANTHROPIC_API_KEY and
+    ANTHROPIC_AUTH_TOKEN are genuinely absent and a subscription run can never
+    silently fall through to per-token API billing.
+
+    `timeout` enforces the wall clock inside the container, where it can
+    actually reach the process group; the host-side join is only a backstop.
+    """
+    return [
+        "/usr/bin/timeout", "--kill-after=30", "--signal=TERM", str(timeout),
+        "/usr/bin/env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN",
+        CLI_BIN,
+        "-p", prompt,
+        "--dangerously-skip-permissions",
         "--allowedTools", *ALLOWED_TOOLS,
         "--disallowedTools", *DISALLOWED_TOOLS,
         "--output-format", "stream-json",
         "--verbose",
         "--max-turns", str(max_turns),
         "--model", model,
+        "--effort", effort,
     ]
-    stdout_path = log_dir / f"{iid}.jsonl"
-    stderr_path = log_dir / f"{iid}.stderr.txt"
+
+
+# --------------------------------------------------------------------------
+# docker plumbing
+# --------------------------------------------------------------------------
+
+def quiet_logger(name):
+    logger = logging.getLogger(name)
+    if not logger.handlers:
+        logger.addHandler(logging.NullHandler())
+    logger.propagate = False
+    return logger
+
+
+def container_exec(container, cmd, *, user=None, environment=None, workdir=None,
+                   timeout=None):
+    """Run a command in a container; return (exit_code, stdout, stderr, timed_out).
+
+    docker_utils.exec_run_with_timeout cannot be used here: it offers no way to
+    pick the user, the working directory, or the environment, and it merges
+    stderr into stdout. All three matter -- Claude must run as a non-root user
+    with the token in its environment, and its stream-json stdout has to stay
+    clean for the transcript.
+    """
+    api = container.client.api
+    exec_id = api.exec_create(
+        container.id, cmd,
+        user=user or "",
+        environment=environment or None,
+        workdir=workdir,
+        stdout=True, stderr=True,
+    )["Id"]
+
+    out_chunks, err_chunks = [], []
+    failure = {}
+
+    def pump():
+        try:
+            for stdout_chunk, stderr_chunk in api.exec_start(exec_id, stream=True, demux=True):
+                if stdout_chunk:
+                    out_chunks.append(stdout_chunk)
+                if stderr_chunk:
+                    err_chunks.append(stderr_chunk)
+        except Exception as exc:  # noqa: BLE001 - reported to the caller
+            failure["error"] = exc
+
+    thread = threading.Thread(target=pump, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    timed_out = thread.is_alive()
+    if timed_out:
+        _kill_exec(container, exec_id)
+        thread.join(60)
+    if failure.get("error") and not timed_out:
+        raise failure["error"]
+
     try:
-        proc = subprocess.run(
-            cmd, cwd=str(cwd), env=build_env(), capture_output=True,
-            text=True, timeout=timeout,
+        code = api.exec_inspect(exec_id).get("ExitCode")
+    except Exception:  # noqa: BLE001 - the exec may already be gone
+        code = None
+    stdout = b"".join(out_chunks).decode("utf-8", "replace")
+    stderr = b"".join(err_chunks).decode("utf-8", "replace")
+    return code, stdout, stderr, timed_out
+
+
+def _kill_exec(container, exec_id):
+    """Best effort stop of a runaway exec and anything it spawned."""
+    try:
+        pid = container.client.api.exec_inspect(exec_id).get("Pid") or 0
+        if pid:
+            container.exec_run(f"kill -TERM {pid}", user="root")
+    except Exception:  # noqa: BLE001
+        pass
+    # The exec PID lives in the daemon's namespace, not the container's, so the
+    # kill above often misses. Matching on the binary path inside this
+    # single-purpose container is the reliable route.
+    for signal_name in ("TERM", "KILL"):
+        try:
+            container.exec_run(f"pkill -{signal_name} -f {CLI_BIN}", user="root")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def sh(container, script, *, user=None, environment=None, timeout=300):
+    """Run a bash snippet (login-free) and return (code, stdout, stderr, timed_out)."""
+    return container_exec(
+        container, ["/bin/bash", "-c", script],
+        user=user, environment=environment, timeout=timeout,
+    )
+
+
+def read_container_bytes(container, path):
+    """Exact bytes of a file in the container, or None if it is not there."""
+    try:
+        stream, _ = container.get_archive(path)
+    except docker.errors.NotFound:
+        return None
+    buf = io.BytesIO()
+    for chunk in stream:
+        buf.write(chunk)
+    buf.seek(0)
+    with tarfile.open(fileobj=buf) as tar:
+        member = next((m for m in tar.getmembers() if m.isfile()), None)
+        if member is None:
+            return None
+        extracted = tar.extractfile(member)
+        return extracted.read() if extracted else None
+
+
+def write_container_bytes(container, path, data: bytes):
+    """Place exact bytes at `path` in the container.
+
+    docker_utils.copy_to_container names the tar member after the *source*
+    file, so it cannot write a chosen destination name, and it needs a real
+    file on the host. This takes the bytes directly.
+    """
+    directory, _, name = path.rpartition("/")
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name=name)
+        info.size = len(data)
+        info.mode = 0o644
+        tar.addfile(info, io.BytesIO(data))
+    container.exec_run(f"mkdir -p {directory or '/'}", user="root")
+    container.put_archive(directory or "/", buf.getvalue())
+
+
+def ensure_image(client, image, quiet=False):
+    """Make sure the published evaluation image is present locally.
+
+    Images are only ever pulled here, never removed: they are several GB each
+    and re-pulling one costs far more than the disk it occupies.
+    """
+    try:
+        client.images.get(image)
+        return False
+    except docker.errors.ImageNotFound:
+        pass
+    if not quiet:
+        print(f"[docker] pulling {image} (first use; several GB)")
+    client.images.pull(image)
+    return True
+
+
+def remove_stale_container(client, name):
+    try:
+        existing = client.containers.get(name)
+    except docker.errors.NotFound:
+        return
+    cleanup_container(client, existing, "quiet")
+
+
+def create_instance_container(client, spec, run_id, cli_cache: Path):
+    """A fresh container on the evaluation image, with the CLI cache mounted.
+
+    docker_build.build_container() is the harness's own helper and would be the
+    natural call here, but it takes no `volumes` argument and evaluation/ is
+    off limits for this change. Every other setting is imported from it rather
+    than restated, so the Mac clamps and the platform stay in lockstep with
+    what the evaluation run uses:
+
+      * platform  -- spec.platform, which test_spec.py pins to linux/x86_64
+      * nano_cpus -- the repo's own value, clamped by LOCAL_MAX_NANO_CPUS
+      * mem_limit -- LOCAL_MAX_MEM_LIMIT
+      * network   -- USE_HOST_NETWORK
+
+    The container itself runs as root so setup can chown /testbed and write the
+    agent's shell profile; Claude is exec'd into it as AGENT_USER.
+    """
+    config = MAP_REPO_VERSION_TO_SPECS[spec.repo][spec.version]
+    nano_cpus = min(config.get("nano_cpus", int(2e9)), LOCAL_MAX_NANO_CPUS)
+    name = spec.get_instance_container_name(run_id)
+    remove_stale_container(client, name)
+    return client.containers.create(
+        image=spec.instance_image_key,
+        name=name,
+        user="root",
+        detach=True,
+        command="tail -f /dev/null",
+        nano_cpus=nano_cpus,
+        platform=spec.platform,
+        network_mode="host" if USE_HOST_NETWORK else None,
+        mem_limit=LOCAL_MAX_MEM_LIMIT,
+        oom_kill_disable=False,
+        oom_score_adj=1000,
+        volumes={str(cli_cache): {"bind": CLI_MOUNT, "mode": "ro"}},
+    )
+
+
+# --------------------------------------------------------------------------
+# the Linux x86-64 Claude Code cache
+# --------------------------------------------------------------------------
+
+BOOTSTRAP_SCRIPT = """
+set -e
+CACHE={mount}
+rm -rf "$CACHE"/node "$CACHE"/npm "$CACHE"/home "$CACHE"/{manifest}
+mkdir -p "$CACHE"/node "$CACHE"/npm "$CACHE"/home
+cd /tmp
+echo "downloading node v{node_version} (linux-x64)"
+curl -fsSL -o node.tar.gz "{node_tarball}"
+tar xzf node.tar.gz -C "$CACHE"/node --strip-components=1
+rm -f node.tar.gz
+export PATH="$CACHE/node/bin:$PATH"
+export HOME="$CACHE/home"
+export npm_config_prefix="$CACHE/npm"
+export npm_config_cache="$CACHE/home/.npm"
+echo "installing {package}@{cli_version}"
+npm install -g --no-fund --no-audit --loglevel=error "{package}@{cli_version}"
+rm -rf "$CACHE/home/.npm"
+echo '{marker}node_version='$(node --version)
+echo '{marker}npm_version='$(npm --version)
+echo '{marker}package_version='$(node -p \
+  "require('$CACHE/npm/lib/node_modules/{package}/package.json').version")
+echo '{marker}uname='$(uname -m)
+# Run the binary for real, outside a command substitution, so `set -e` catches a
+# crash here rather than letting the error text through as a "version".
+# On Apple Silicon this is where an emulation problem surfaces: the linux-x64
+# build uses AVX, and a Docker Desktop configured without Rosetta cannot run it.
+"$CACHE"/npm/bin/claude --version > /tmp/cli_version.txt 2>&1
+"$CACHE"/npm/bin/claude --help > "$CACHE"/claude-help.txt 2>&1
+test -s "$CACHE"/claude-help.txt
+echo '{marker}cli_version='$(head -1 /tmp/cli_version.txt)
+# The auth variable is read straight out of the binary that will actually run,
+# rather than assumed from whatever version is installed on the host. The same
+# probe covers options that are real but undocumented -- --max-turns is in the
+# binary and works, yet `claude --help` never lists it, so asserting on the
+# help text would reject a perfectly good build. The control string must score
+# 0: a grep that silently matches everything cannot pass this off as success.
+# `|| true` rather than `|| echo 0`: grep -c prints the count and *then* exits 1
+# when it is zero, so "|| echo 0" would make the marker read "0 0".
+BIN="$CACHE"/npm/lib/node_modules/{package}/bin/claude.exe
+echo '{marker}oauth_var='$(grep -ac CLAUDE_CODE_OAUTH_TOKEN "$BIN" 2>/dev/null || true)
+echo '{marker}flag_max_turns='$(grep -ac -- 'max-turns' "$BIN" 2>/dev/null || true)
+echo '{marker}grep_control='$(grep -ac -- 'definitely-not-a-claude-flag' "$BIN" 2>/dev/null || true)
+"""
+
+
+HELP_NAME = "claude-help.txt"
+
+
+def verify_cli_capabilities(help_text: str, effort: str) -> list:
+    """Check the flags this driver depends on against the CLI's own --help.
+
+    The CLI in the container is not the one on the host and moves fast, so the
+    contract is confirmed against the installed build rather than assumed:
+    `--effort` with the level we ask for, the flags the run is built around,
+    and `setup-token`, which is how the subscription credential this driver
+    passes in CLAUDE_CODE_OAUTH_TOKEN is minted in the first place.
+    """
+    problems = []
+    if not help_text.strip():
+        return ["`claude --help` produced no output in the container"]
+    # --max-turns is deliberately absent from this list: it is a working but
+    # undocumented option, checked against the binary by verify_hidden_flags.
+    for flag in ("--effort", "--model", "--output-format",
+                 "--disallowedTools", "--dangerously-skip-permissions", "--print"):
+        if flag not in help_text:
+            problems.append(f"the installed CLI does not list {flag}")
+    if "--effort" in help_text and effort not in help_text:
+        problems.append(f"the installed CLI does not list an effort level named "
+                        f"{effort!r}; `claude --help` describes --effort as: "
+                        + _help_line(help_text, "--effort"))
+    if "setup-token" not in help_text:
+        problems.append("the installed CLI has no `setup-token` command, so "
+                        "CLAUDE_CODE_OAUTH_TOKEN may no longer be the right "
+                        "way to authenticate")
+    return problems
+
+
+def _marker_count(markers: dict, key: str) -> int:
+    """A marker's value as a count; anything unparseable reads as zero."""
+    try:
+        return int(str(markers.get(key, "")).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def verify_hidden_flags(markers: dict) -> list:
+    """Check options that work but are absent from `claude --help`.
+
+    `--max-turns` is the case that matters: the CLI accepts it in print mode,
+    but it is not in the visible option list, so asserting on the help text
+    would reject a good build. Its presence in the binary is the signal
+    instead -- guarded by a control string that must NOT be found, so a grep
+    matching everything cannot masquerade as a pass.
+    """
+    control = markers.get("grep_control")
+    if control is None or control == "":
+        return ["the binary probe did not run: no control count came back, so a "
+                "positive result for any flag would mean nothing"]
+    if str(control) != "0":
+        return [f"the binary probe is unreliable: a control string that should "
+                f"appear 0 times was reported as {control!r}"]
+    problems = []
+    for key, flag in (("flag_max_turns", "--max-turns"),):
+        if _marker_count(markers, key) <= 0:
+            problems.append(f"{flag} does not appear in the installed CLI binary")
+    return problems
+
+
+def _help_line(help_text: str, flag: str) -> str:
+    """The flag's own help entry, flattened, for a useful error message."""
+    lines = help_text.splitlines()
+    for i, line in enumerate(lines):
+        if flag in line:
+            return " ".join(x.strip() for x in lines[i:i + 3])
+    return "(not found)"
+
+
+def cli_cache_manifest(cli_cache: Path) -> Optional[dict]:
+    path = cli_cache / MANIFEST_NAME
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def bootstrap_cli(client, cli_cache: Path, image: str, cli_version: str,
+                  effort: str = "xhigh", force=False):
+    """Install Node + the Claude Code CLI into the host-side cache, once.
+
+    Why a mounted, pre-installed copy rather than installing per instance:
+    the npm package is a thin wrapper whose postinstall drops a ~hundreds-of-MB
+    native binary into place. Doing that inside all 140 containers would
+    re-download it 140 times, put the run at the mercy of a registry hiccup
+    mid-sweep, and -- worst for a benchmark -- let the CLI version drift
+    between instances. Building it once into a directory that every container
+    bind-mounts read-only fixes the version for the whole sweep, costs nothing
+    per instance, and keeps the agent from being able to modify its own binary.
+
+    The build runs inside a linux/amd64 container so the installer resolves
+    `linux-x64` and links against the same glibc the evaluation images use --
+    an npm install on this arm64 macOS host would fetch the darwin-arm64
+    binary, which cannot run in the container at all.
+
+    Node ends up in the cache because npm needs it to run that postinstall.
+    After it, `claude` is the native binary and Node is never invoked again.
+    """
+    existing = cli_cache_manifest(cli_cache)
+    if existing and not force:
+        help_path = cli_cache / HELP_NAME
+        problems = verify_cli_capabilities(
+            help_path.read_text(errors="replace") if help_path.exists() else "", effort)
+        if "--max-turns" not in (existing.get("hidden_flags_verified") or []):
+            problems.append("this cache predates the --max-turns binary check")
+        if problems:
+            raise RuntimeError(
+                "the cached Claude Code CLI does not support what this run asks "
+                "of it:\n  - " + "\n  - ".join(problems)
+                + "\n\nRebuild the cache with --bootstrap_cli."
+            )
+        return existing, False
+
+    cli_cache.mkdir(parents=True, exist_ok=True)
+    ensure_image(client, image)
+    print(f"[cli] building the Linux x86-64 Claude Code cache in {cli_cache}")
+    container = client.containers.create(
+        image=image,
+        user="root",
+        detach=True,
+        command="tail -f /dev/null",
+        platform="linux/x86_64",
+        mem_limit=LOCAL_MAX_MEM_LIMIT,
+        volumes={str(cli_cache): {"bind": CLI_MOUNT, "mode": "rw"}},
+    )
+    try:
+        container.start()
+        script = BOOTSTRAP_SCRIPT.format(
+            mount=CLI_MOUNT, manifest=MANIFEST_NAME, node_version=NODE_VERSION,
+            node_tarball=NODE_TARBALL, package=CLI_NPM_PACKAGE,
+            cli_version=cli_version, marker=MARKER,
         )
-        rc, err = proc.returncode, None
-        stdout, stderr = as_text(proc.stdout), as_text(proc.stderr)
-    except subprocess.TimeoutExpired as exc:
-        rc, err = None, f"timeout after {timeout}s"
-        stdout, stderr = as_text(exc.stdout), as_text(exc.stderr)
-        stderr += f"\n--- TIMEOUT after {timeout}s ---\n"
+        code, out, err, timed_out = sh(container, script, timeout=1800)
+        if timed_out or code != 0:
+            raise RuntimeError(
+                "Claude Code CLI bootstrap failed "
+                f"({'timed out' if timed_out else f'exit {code}'}).\n"
+                + (out + err)[-4000:]
+            )
+        markers = parse_markers(out)
+        if not markers.get("cli_version"):
+            raise RuntimeError(
+                "the CLI installed but `claude --version` produced nothing.\n"
+                "On Apple Silicon this usually means the linux-x64 build hit an\n"
+                "unsupported instruction under emulation -- see the Rosetta/AVX\n"
+                "note in README_ClaudeCode.md.\n" + (out + err)[-4000:]
+            )
+        help_text = (cli_cache / HELP_NAME).read_text(errors="replace") \
+            if (cli_cache / HELP_NAME).exists() else ""
+        capability_problems = verify_cli_capabilities(help_text, effort)
+        if capability_problems:
+            raise RuntimeError(
+                "the Claude Code CLI installed in the container does not "
+                "support what this driver asks of it:\n  - "
+                + "\n  - ".join(capability_problems)
+            )
+        hidden_problems = verify_hidden_flags(markers)
+        if hidden_problems:
+            raise RuntimeError(
+                "the Claude Code CLI installed in the container is missing an "
+                "option this driver passes:\n  - " + "\n  - ".join(hidden_problems)
+            )
+        if _marker_count(markers, "oauth_var") <= 0:
+            raise RuntimeError(
+                "CLAUDE_CODE_OAUTH_TOKEN does not appear in the installed CLI "
+                "binary; its authentication contract has changed and this "
+                "driver's token handling needs to be revisited."
+            )
+        manifest = {
+            "built_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "built_in_image": image,
+            "node_version": markers.get("node_version"),
+            "npm_version": markers.get("npm_version"),
+            "npm_package": CLI_NPM_PACKAGE,
+            "npm_package_version": markers.get("package_version"),
+            "claude_version": markers.get("cli_version"),
+            "container_arch": markers.get("uname"),
+            "effort_verified": effort,
+            "hidden_flags_verified": ["--max-turns"],
+            "help_file": HELP_NAME,
+            "oauth_env_var": "CLAUDE_CODE_OAUTH_TOKEN",
+        }
+        (cli_cache / MANIFEST_NAME).write_text(json.dumps(manifest, indent=2) + "\n")
+        print(f"[cli] {manifest['claude_version']} "
+              f"(node {manifest['node_version']}, {CLI_NPM_PACKAGE}@"
+              f"{manifest['npm_package_version']})")
+        return manifest, True
+    finally:
+        cleanup_container(client, container, "quiet")
 
-    stdout_path.write_text(stdout)
-    stderr_path.write_text(stderr)
-    return rc, err, parse_result_line(stdout), stdout, stderr
+
+# --------------------------------------------------------------------------
+# per-instance work
+# --------------------------------------------------------------------------
+
+def setup_agent_user(container, env_name, timeout=600):
+    """Non-root user, writable /testbed, conda active in its shell.
+
+    /testbed is chowned to the agent before git touches it so the repository is
+    created by, and owned by, the same user Claude runs as -- otherwise git
+    refuses to work in it ("dubious ownership") and the index is unwritable.
+    """
+    script = "\n".join([
+        "set -e",
+        f"id -u {AGENT_USER} >/dev/null 2>&1 || "
+        f"adduser --disabled-password --gecos 'agent' {AGENT_USER}",
+        f"mkdir -p {AGENT_HOME}",
+        f"chown -R {AGENT_USER}:{AGENT_USER} {AGENT_HOME}",
+        f"chown -R {AGENT_USER}:{AGENT_USER} {REPO_DIR}",
+        # An interactive or login shell Claude opens lands in the same env its
+        # own process already has, so `python` and `pytest` work everywhere.
+        f"cat > {AGENT_HOME}/.bashrc <<'EOF_BASHRC'",
+        f"source {CONDA_ROOT}/etc/profile.d/conda.sh",
+        f"conda activate {env_name}",
+        f"export PATH={CLI_MOUNT}/npm/bin:$PATH",
+        "EOF_BASHRC",
+        f"cat > {AGENT_HOME}/.profile <<'EOF_PROFILE'",
+        f"[ -f {AGENT_HOME}/.bashrc ] && . {AGENT_HOME}/.bashrc",
+        "EOF_PROFILE",
+        f"chown {AGENT_USER}:{AGENT_USER} {AGENT_HOME}/.bashrc {AGENT_HOME}/.profile",
+        f"su {AGENT_USER} -c 'git config --global --add safe.directory {REPO_DIR}'",
+        f"su {AGENT_USER} -c 'git config --global init.defaultBranch main'",
+    ])
+    return sh(container, script, user="root", timeout=timeout)
 
 
-def problem_statement_for(inst):
-    for key in ("problem_statement_realistic", "problem_statement"):
-        if inst.get(key):
-            return inst[key]
-    raise KeyError(f"no problem statement on {inst['instance_id']}")
+def check_auth_env_clean(container, env_name, token, timeout=60):
+    """Confirm the API-key variables really are absent inside the container."""
+    cmd = ["/usr/bin/env", "-u", "ANTHROPIC_API_KEY", "-u", "ANTHROPIC_AUTH_TOKEN",
+           "/bin/bash", "-c",
+           # Reports presence only. Echoing a credential's *value* to find out
+           # whether it is set would be the very leak this check exists to rule out.
+           f'echo "{MARKER}api_key=$([ -n "$ANTHROPIC_API_KEY" ] && echo set || echo unset)"; '
+           f'echo "{MARKER}auth_token=$([ -n "$ANTHROPIC_AUTH_TOKEN" ] && echo set || echo unset)"; '
+           f'echo "{MARKER}oauth_present=$([ -n "$CLAUDE_CODE_OAUTH_TOKEN" ] && echo yes || echo no)"']
+    _, out, _, _ = container_exec(
+        container, cmd, user=AGENT_USER,
+        environment=agent_environment(env_name, token), timeout=timeout,
+    )
+    markers = parse_markers(out)
+    problems = []
+    if markers.get("api_key") != "unset":
+        problems.append("ANTHROPIC_API_KEY is set inside the container")
+    if markers.get("auth_token") != "unset":
+        problems.append("ANTHROPIC_AUTH_TOKEN is set inside the container")
+    if markers.get("oauth_present") != "yes":
+        problems.append("CLAUDE_CODE_OAUTH_TOKEN did not reach the container")
+    return problems
 
 
-def prompt_template_for(style):
-    return VERBATIM_TEMPLATE if style == "verbatim" else PROMPT_TEMPLATE
+def establish_baseline(container, environment, timeout=1800):
+    """Single-commit /testbed, then verify it. Returns (report, problems, log)."""
+    code, out, err, timed_out = sh(container, build_baseline_script(),
+                                   user=AGENT_USER, environment=environment,
+                                   timeout=timeout)
+    if timed_out or code != 0:
+        reason = "timed out" if timed_out else f"exit {code}"
+        return {}, [f"baseline commit failed ({reason})"], (out + err)[-4000:]
+    vcode, vout, verr, vtimed = sh(container, build_verify_script(),
+                                   user=AGENT_USER, environment=environment,
+                                   timeout=300)
+    if vtimed or vcode != 0:
+        reason = "timed out" if vtimed else f"exit {vcode}"
+        return {}, [f"baseline verification failed ({reason})"], (vout + verr)[-4000:]
+    report = parse_baseline_report(vout)
+    return report, baseline_problems(report), vout[-4000:]
 
 
-def build_prompt(inst, style):
-    return prompt_template_for(style).format(problem_statement=problem_statement_for(inst))
+def container_cli_version(container, env_name, timeout=120):
+    """The CLI version reported by the binary that will actually run.
+
+    Asked without the token: printing a version needs no credential, and the
+    fewer execs carry one the smaller the surface for it to escape through.
+    """
+    _, out, err, _ = container_exec(
+        container, [CLI_BIN, "--version"], user=AGENT_USER,
+        environment=agent_environment(env_name), timeout=timeout,
+    )
+    text = (out or err).strip().splitlines()
+    return text[0].strip() if text else "unknown"
 
 
-def process(inst, args, cache_dir, work_dir, log_dir, run_idx, stop_event=None):
+def run_claude(container, prompt, env_name, token, args, log_dir, iid):
+    """Run headless Claude Code in the container, saving the full transcript.
+
+    Returns (exit_code, timeout_error, claude_result, stdout, stderr). stdout
+    and stderr are redacted before they are written or returned.
+    """
+    cmd = claude_command(prompt, args.model, args.effort, args.max_turns, args.timeout)
+    code, stdout, stderr, host_timeout = container_exec(
+        container, cmd,
+        user=AGENT_USER,
+        environment=agent_environment(env_name, token),
+        workdir=REPO_DIR,
+        # `timeout` inside the container owns the wall clock; the host join is
+        # only there in case the exec stream itself wedges.
+        timeout=args.timeout + 180,
+    )
+    stdout, stderr = redact(stdout, token), redact(stderr, token)
+
+    # 124 is coreutils `timeout` giving up; 137 is the follow-up SIGKILL.
+    err = None
+    if host_timeout:
+        err = f"exec stream stalled past {args.timeout + 180}s"
+    elif code in (124, 137):
+        err = f"timeout after {args.timeout}s"
+    if err:
+        stderr += f"\n--- TIMEOUT: {err} ---\n"
+
+    (log_dir / f"{iid}.jsonl").write_text(stdout)
+    (log_dir / f"{iid}.stderr.txt").write_text(stderr)
+    return code, err, parse_result_line(stdout), stdout, stderr
+
+
+def extract_patch(container, meta, environment, timeout=900):
+    """Filter the working tree, then diff it against the baseline commit.
+
+    Everything runs as the agent user, which owns the repository. The diff is
+    written to a file and read back as raw bytes rather than scraped off an
+    exec stream, so a patch is never corrupted by interleaving.
+    """
+    def git(script):
+        return sh(container, f"cd {REPO_DIR}\n{script}", user=AGENT_USER,
+                  environment=environment, timeout=timeout)
+
+    status_path = "/tmp/sweperf_status.z"
+    git(f"git status --porcelain -z -uall > {status_path}")
+    entries = parse_porcelain_z(read_container_bytes(container, status_path) or b"")
+    plan = classify_worktree(entries)
+
+    apply_to_paths(container, plan["revert"], "git checkout --", environment, timeout)
+    apply_to_paths(container, plan["remove"], "rm -rf --", environment, timeout)
+
+    meta["reverted_tests"] = filtered_by(plan, "test_file")
+    meta["removed_scratch_files"] = filtered_by(plan, "scratch")
+    meta["build_artifacts_filtered"] = filtered_by(plan, "build_artifact")
+    meta["new_files"] = plan["new_files"]
+
+    # `git add -A` without -f on purpose: .gitignore no longer applies to the
+    # paths the baseline tracks, so real edits are staged, while anything new
+    # the build dropped in an ignored directory stays out of the diff.
+    git("git add -A")
+
+    # A binary file in the diff has no usable hunk -- `git diff` emits only
+    # "Binary files ... differ", which `git apply` then refuses. Drop those
+    # paths rather than ship a patch that cannot apply.
+    _, numstat, _, _ = git("git diff --cached --numstat")
+    binaries = parse_numstat_binaries(numstat)
+    if binaries:
+        apply_to_paths(container, binaries, "git reset -q HEAD --", environment, timeout)
+        apply_to_paths(container, binaries, "git checkout --", environment, timeout)
+        git("git add -A")
+    meta["binary_files_dropped"] = binaries
+
+    patch_path = "/tmp/sweperf_model.patch"
+    git(f"git diff --cached > {patch_path}")
+    raw = read_container_bytes(container, patch_path) or b""
+    return raw.decode("utf-8", "replace")
+
+
+def apply_to_paths(container, paths, command, environment, timeout=900):
+    """Run `command` over `paths` inside the container, NUL-separated.
+
+    Paths come out of the agent's working tree and can contain anything at all
+    -- spaces, quotes, newlines. The list is written to a file as raw bytes and
+    fed to `xargs -0`, so nothing is ever parsed by a shell.
+    """
+    if not paths:
+        return
+    list_path = f"{AGENT_HOME}/.sweperf_paths.z"
+    write_container_bytes(container, list_path,
+                          b"".join(p.encode("utf-8") + b"\0" for p in paths))
+    sh(container,
+       f"cd {REPO_DIR} && xargs -0 -r -a {list_path} {command} 2>/dev/null; "
+       f"rm -f {list_path}",
+       user=AGENT_USER, environment=environment, timeout=timeout)
+
+
+def process(inst, args, client, log_dir, run_idx, token, cli_cache):
     iid = inst["instance_id"]
-    if stop_event is not None and stop_event.is_set():
-        return None, {"instance_id": iid, "run": run_idx, "status": "cancelled",
-                      "reverted_tests": [], "duration_s": 0.0}
-    dest = work_dir / f"{iid}__run{run_idx}"
     started = time.time()
-    meta = {"instance_id": iid, "run": run_idx, "status": "ok", "reverted_tests": []}
+    meta = {
+        "instance_id": iid, "run": run_idx, "status": "ok",
+        "execution_env": "docker_with_deps",
+        "reverted_tests": [], "removed_scratch_files": [], "new_files": [],
+        "build_artifacts_filtered": [], "binary_files_dropped": [],
+    }
+    container = None
+    patch = ""
+    logger = quiet_logger(f"claudegen.{iid}")
     try:
-        mirror = ensure_mirror(inst["repo"], cache_dir, inst["base_commit"])
-        prepare_checkout(inst["repo"], inst["base_commit"], mirror, dest)
+        spec = make_test_spec(inst, is_eval=True)
+        spec.instance_image_key = remote_image_key(iid)
+        env_name = env_name_for(spec)
+        meta["image"] = spec.instance_image_key
+        meta["conda_env"] = env_name
 
-        prompt = build_prompt(inst, args.prompt_style)
-        rc, err, result, stdout, stderr = run_claude(
-            prompt, dest, args.timeout, args.model, args.max_turns, log_dir, iid
+        prompt = build_prompt(inst)
+        meta["prompt_style"] = PROMPT_STYLE
+        meta["prompt_sha256"] = hashlib.sha256(prompt.encode()).hexdigest()
+
+        ensure_image(client, spec.instance_image_key)
+        container = create_instance_container(client, spec, args.run_id, cli_cache)
+        container.start()
+
+        code, out, err, timed_out = setup_agent_user(container, env_name)
+        if timed_out or code != 0:
+            meta["status"] = "setup_failed"
+            meta["error"] = f"agent user setup failed: {(out + err)[-1500:]}"
+            return None, meta, iid
+
+        auth_problems = check_auth_env_clean(container, env_name, token)
+        if auth_problems:
+            meta["status"] = "setup_failed"
+            meta["error"] = "; ".join(auth_problems)
+            return None, meta, iid
+
+        agent_env = agent_environment(env_name)
+        report, problems, log = establish_baseline(container, agent_env)
+        meta["baseline"] = report
+        if problems:
+            meta["status"] = "setup_failed"
+            meta["error"] = "baseline not isolated: " + "; ".join(problems)
+            meta["baseline_log"] = log
+            return None, meta, iid
+
+        meta["claude_version"] = container_cli_version(container, env_name)
+
+        rc, err_text, result, stdout, stderr = run_claude(
+            container, prompt, env_name, token, args, log_dir, iid
         )
         if result is not None:
             meta["claude_result"] = result
@@ -404,7 +1191,7 @@ def process(inst, args, cache_dir, work_dir, log_dir, run_idx, stop_event=None):
         if suspects:
             meta["web_access_suspect"] = suspects
 
-        if err:
+        if err_text:
             meta["status"] = "timeout"
         elif rc != 0:
             result_text = json.dumps(result) if result else ""
@@ -413,39 +1200,35 @@ def process(inst, args, cache_dir, work_dir, log_dir, run_idx, stop_event=None):
             else:
                 meta["status"] = f"claude_exit_{rc}"
 
-        scrub_artifacts(dest)
-        meta["reverted_tests"] = revert_test_edits(dest)
-        removed, new_files = clean_scratch_files(dest)
-        meta["removed_scratch_files"] = removed
-        meta["new_files"] = new_files
-        patch = extract_patch(dest)
+        patch = extract_patch(container, meta, agent_env)
         if not patch.strip() and meta["status"] == "ok":
             meta["status"] = "empty_patch"
         meta["patch_bytes"] = len(patch)
         meta["files_changed"] = patch.count("diff --git ")
-    except Exception as exc:  # keep one bad instance from killing the run
+    except Exception as exc:  # keep one bad instance from killing the sweep
         meta["status"] = "error"
-        meta["error"] = f"{type(exc).__name__}: {exc}"
+        meta["error"] = redact(f"{type(exc).__name__}: {exc}", token)
         patch = ""
     finally:
-        if not args.keep_clones:
-            shutil.rmtree(dest, ignore_errors=True)
+        if container is not None and not args.keep_containers:
+            cleanup_container(client, container, logger)
+        elif container is not None:
+            print(f"  [keep] container left running: {container.name}")
+        # Set here, not after the block: the setup paths above return early
+        # and the caller prints this field for every outcome.
+        meta["duration_s"] = round(time.time() - started, 1)
 
-    meta["duration_s"] = round(time.time() - started, 1)
     record = {
         "instance_id": iid,
         "model_name_or_path": args.model_name,
         "model_patch": patch,
     }
-    return record, meta
+    return record, meta, iid
 
 
-# Statuses that must NOT get a prediction line: leaving them out of the
-# predictions file is what makes --resume pick them up again.
-RETRY_STATUSES = ("error", "usage_limit", "cancelled", "timeout")
-# "timeout" is here deliberately: a killed run leaves a mid-edit working tree,
-# and that truncated diff is a wrong data point, not a slow one.
-
+# --------------------------------------------------------------------------
+# orchestration
+# --------------------------------------------------------------------------
 
 def already_done(path: Path):
     done = set()
@@ -457,15 +1240,6 @@ def already_done(path: Path):
                 except (json.JSONDecodeError, KeyError):
                     pass
     return done
-
-
-def claude_version():
-    try:
-        proc = subprocess.run(["claude", "--version"], capture_output=True,
-                              text=True, timeout=30)
-        return proc.stdout.strip() or "unknown"
-    except Exception:
-        return "unknown"
 
 
 def run_paths(out_path: Path, run_idx: int, num_runs: int):
@@ -481,16 +1255,18 @@ def run_paths(out_path: Path, run_idx: int, num_runs: int):
 
 
 def load_instances(args):
-    """Either a SWE-Perf-style HF dataset or a JSONL of arbitrary instances.
+    """Either a SWE-Perf-style HF dataset or a JSONL of the same records.
 
-    The JSONL form is what you want for SWE-fficiency and for real-life issues:
-    one object per line with instance_id, repo, base_commit, problem_statement.
+    The JSONL form still has to be SWE-Perf shaped -- make_test_spec needs
+    repo/version/base_commit/test_patch, and an evaluation image must exist for
+    the instance_id, since that image *is* the environment now.
     """
     if args.instances_file:
         path = Path(args.instances_file).resolve()
         if not path.exists():
             sys.exit(f"error: no such instances file: {path}")
-        instances, required = [], ("instance_id", "repo", "base_commit")
+        instances = []
+        required = ("instance_id", "repo", "base_commit", "version", "test_patch")
         for n, line in enumerate(path.read_text().splitlines(), 1):
             if not line.strip():
                 continue
@@ -498,7 +1274,7 @@ def load_instances(args):
                 inst = json.loads(line)
             except json.JSONDecodeError as exc:
                 sys.exit(f"error: {path}:{n} is not valid JSON: {exc}")
-            missing = [k for k in required if not inst.get(k)]
+            missing = [k for k in required if inst.get(k) in (None, "")]
             if missing:
                 sys.exit(f"error: {path}:{n} missing field(s): {', '.join(missing)}")
             if not (inst.get("problem_statement_realistic") or inst.get("problem_statement")):
@@ -517,8 +1293,9 @@ def load_instances(args):
     return list(dataset)
 
 
-def execute_run(run_idx, instances, args, out_path, cache_dir, work_dir, log_root, version):
-    """Run one sweep. Returns (status counts, hit_usage_limit)."""
+def execute_run(run_idx, instances, args, out_path, log_root, client, token,
+                cli_cache, manifest):
+    """Run one sweep, one container at a time. Returns (counts, hit_usage_limit)."""
     preds_path, meta_path, prov_path = run_paths(out_path, run_idx, args.num_runs)
     log_dir = log_root / f"run{run_idx}"
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -532,11 +1309,7 @@ def execute_run(run_idx, instances, args, out_path, cache_dir, work_dir, log_roo
         print(f"[run {run_idx}] nothing to do")
         return {}, False
 
-    template = prompt_template_for(args.prompt_style)
-    prompt_sha = hashlib.sha256(template.encode()).hexdigest()[:PROMPT_HASH_LEN]
-    template_path = preds_path.with_name(f"prompt_template_{prompt_sha}.txt")
-    if not template_path.exists():
-        template_path.write_text(template)
+    prompts = {i["instance_id"]: build_prompt(i) for i in todo}
 
     # Provenance is appended, not overwritten, so a CLI upgrade partway through
     # a resumed run stays visible in the record.
@@ -544,113 +1317,183 @@ def execute_run(run_idx, instances, args, out_path, cache_dir, work_dir, log_roo
         f.write(json.dumps({
             "run": run_idx,
             "started_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            "claude_version": version,
+            "execution_env": "docker_with_deps",
+            "image_template": IMAGE_TEMPLATE,
+            "images": {i["instance_id"]: remote_image_key(i["instance_id"]) for i in todo},
+            "claude_version": manifest.get("claude_version"),
+            "claude_cli_source": {
+                "npm_package": manifest.get("npm_package"),
+                "npm_package_version": manifest.get("npm_package_version"),
+                "node_version": manifest.get("node_version"),
+                "built_at": manifest.get("built_at"),
+                "built_in_image": manifest.get("built_in_image"),
+            },
             "model_flag": args.model,
             "model_id": args.model,
+            "effort": args.effort,
             "model_name_or_path": args.model_name,
             "allowed_tools": ALLOWED_TOOLS,
             "disallowed_tools": DISALLOWED_TOOLS,
             "max_turns": args.max_turns,
-            "execution_env": "host_checkout_no_dependencies",
-            "prompt_style": args.prompt_style,
-            "prompt_template_file": template_path.name,
-            "prompt_sha256": prompt_sha,
+            "prompt_style": PROMPT_STYLE,
+            "prompt_source_field": "problem_statement_realistic",
+            # Kept a plain string for analysis/provenance_audit.py, which
+            # compares this field against a single hash.
+            "prompt_sha256": sha256_16(VERBATIM_TEMPLATE),
+            "prompt_sha256_by_instance": {
+                iid: hashlib.sha256(p.encode()).hexdigest() for iid, p in prompts.items()
+            },
             "timeout_s": args.timeout,
             "instances": len(todo),
         }) + "\n")
 
     print(f"[run {run_idx}/{args.num_runs}] {len(todo)} instance(s), "
-          f"{args.workers} worker(s) -> {preds_path}")
+          f"one container at a time -> {preds_path}")
 
     counts = {}
-    stop_event = threading.Event()
     hit_limit = False
-    with open(preds_path, "a") as out_f, open(meta_path, "a") as meta_f, \
-            ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = [
-            pool.submit(process, inst, args, cache_dir, work_dir, log_dir,
-                        run_idx, stop_event)
-            for inst in todo
-        ]
-        for n, fut in enumerate(as_completed(futures), 1):
-            if fut.cancelled():
-                continue
-            record, meta = fut.result()
+    with open(preds_path, "a") as out_f, open(meta_path, "a") as meta_f:
+        for n, inst in enumerate(todo, 1):
+            record, meta, iid = process(inst, args, client, log_dir, run_idx,
+                                        token, cli_cache)
             status = meta["status"]
             counts[status] = counts.get(status, 0) + 1
-            if status == "cancelled":
-                continue
-            with _write_lock:
-                # error/usage_limit get a meta line but no prediction, so that a
-                # later --resume treats them as unfinished and retries them.
-                if status not in RETRY_STATUSES and record is not None:
-                    out_f.write(json.dumps(record) + "\n"); out_f.flush()
-                meta_f.write(json.dumps(meta) + "\n"); meta_f.flush()
+            # error/usage_limit get a meta line but no prediction, so that a
+            # later --resume treats them as unfinished and retries them.
+            if status not in RETRY_STATUSES and record is not None:
+                out_f.write(json.dumps(record) + "\n"); out_f.flush()
+            meta_f.write(json.dumps(meta) + "\n"); meta_f.flush()
+
             note = (f" (reverted {len(meta['reverted_tests'])} test file(s))"
                     if meta["reverted_tests"] else "")
+            if meta.get("build_artifacts_filtered"):
+                note += f" ({len(meta['build_artifacts_filtered'])} build artifact(s) filtered)"
             if meta.get("web_access_suspect"):
                 note += f" (!! {len(meta['web_access_suspect'])} audit hit(s))"
-            print(f"  [run {run_idx}] [{n}/{len(todo)}] {meta['instance_id']}: "
+            if meta.get("error"):
+                note += f" -- {meta['error'][:200]}"
+            print(f"  [run {run_idx}] [{n}/{len(todo)}] {iid}: "
                   f"{status}, {meta.get('files_changed', 0)} file(s), "
                   f"{meta['duration_s']}s{note}")
-            if status == "usage_limit" and args.stop_on_limit and not hit_limit:
+
+            if status == "usage_limit" and args.stop_on_limit:
                 hit_limit = True
-                stop_event.set()
-                cancelled = sum(1 for f in futures if f.cancel())
-                counts["cancelled"] = counts.get("cancelled", 0) + cancelled
-                print(f"  [run {run_idx}] usage limit hit -- cancelled {cancelled} "
-                      f"queued instance(s); waiting for in-flight work to finish")
+                remaining = len(todo) - n
+                counts["cancelled"] = counts.get("cancelled", 0) + remaining
+                print(f"  [run {run_idx}] usage limit hit -- stopping with "
+                      f"{remaining} instance(s) not started")
+                break
     return counts, hit_limit
 
 
+TIMED_PATH_PATTERN = r"[t]imed_path\.py"
+
+
+def wait_for_timed_path(poll=60):
+    """Never run beside analysis/timed_path.py: two containers do not fit.
+
+    The Mac has 16 GB and runs these x86-64 images under emulation; a second
+    container of the same family either fails to start or makes both runs so
+    slow that the timing analysis it is doing becomes meaningless.
+    """
+    first = True
+    while True:
+        # "[t]imed_path\.py" rather than "timed_path.py": the bracket makes the
+        # pattern not match its own text, so a wrapper whose command line
+        # mentions this script (a watchdog, a `bash -c` loop) is not mistaken
+        # for a running analysis and waited on forever.
+        proc = subprocess.run(["pgrep", "-f", TIMED_PATH_PATTERN],
+                              capture_output=True, text=True)
+        pids = [p for p in proc.stdout.split() if p]
+        if not pids:
+            if not first:
+                print("[wait] timed_path.py finished; continuing")
+            return
+        if first:
+            print(f"[wait] analysis/timed_path.py is running (pid {', '.join(pids)}); "
+                  f"waiting for it to finish before starting a container")
+            first = False
+        time.sleep(poll)
+
+
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dataset_name", default="SWE-Perf/SWE-Perf")
     p.add_argument("--split", default="test")
     p.add_argument("--instances_file", default=None,
-                   help="JSONL of {instance_id, repo, base_commit, problem_statement} "
-                        "instead of an HF dataset (use for SWE-fficiency / real-life issues)")
-    p.add_argument("--output", default="../../datasets/outputs/claude_code_preds.jsonl")
+                   help="JSONL of SWE-Perf-shaped records instead of an HF dataset; "
+                        "each instance still needs a published evaluation image")
+    p.add_argument("--output", default=DEFAULT_OUTPUT,
+                   help="predictions JSONL; meta, provenance and transcripts "
+                        "are written beside it")
     p.add_argument("--model_name", default="claude-code",
                    help="value written to model_name_or_path (names the log dir at eval time)")
     p.add_argument("--model", required=True,
                    help="REQUIRED full model ID passed to the claude CLI "
                         "(e.g. claude-opus-5); required so the model can never "
                         "change silently between runs")
+    p.add_argument("--effort", default="xhigh",
+                   choices=("low", "medium", "high", "xhigh", "max"),
+                   help="--effort passed to the claude CLI (default: xhigh)")
     p.add_argument("--max_turns", type=int, default=100,
                    help="--max-turns passed to the claude CLI (agentic turn cap)")
-    p.add_argument("--prompt_style", choices=("custom", "verbatim"), default="custom",
-                   help="custom: our PROMPT_TEMPLATE wrapper; verbatim: send "
-                        "problem_statement_realistic exactly as the benchmark writes it")
     p.add_argument("--num_runs", type=int, default=1,
                    help="repeat the whole sweep N times; each instance gets a fresh "
-                        "claude process (fresh context) and its own predictions file")
+                        "container and a fresh claude process, and its own predictions file")
     p.add_argument("--instance_ids", nargs="*", default=None)
     p.add_argument("--limit", type=int, default=None, help="only the first N instances")
-    p.add_argument("--workers", type=int, default=1)
-    p.add_argument("--timeout", type=int, default=1800, help="per-instance wall clock (s)")
-    p.add_argument("--work_dir", default="../../datasets/claude_code_workspaces")
-    p.add_argument("--cache_dir", default="../../datasets/repo_mirrors")
-    p.add_argument("--keep_clones", action="store_true", help="keep checkouts for debugging")
+    p.add_argument("--timeout", type=int, default=1800,
+                   help="per-instance wall clock for the claude run (s)")
+    p.add_argument("--run_id", default="claudegen",
+                   help="suffix for container names, so a stale container is easy to spot")
+    p.add_argument("--cli_cache", default=DEFAULT_CLI_CACHE,
+                   help="host directory holding the Linux x86-64 Claude Code install "
+                        "that every container mounts read-only")
+    p.add_argument("--cli_version", default="latest",
+                   help="npm version spec for @anthropic-ai/claude-code in the cache; "
+                        "the resolved version is recorded in provenance")
+    p.add_argument("--bootstrap_cli", action="store_true",
+                   help="rebuild the CLI cache even if it already exists")
+    p.add_argument("--bootstrap_image", default=None,
+                   help="image to build the CLI cache in (default: the first "
+                        "selected instance's evaluation image)")
+    p.add_argument("--bootstrap_only", action="store_true",
+                   help="build the CLI cache and exit without running any instance")
+    p.add_argument("--keep_containers", action="store_true",
+                   help="leave each instance container running for debugging")
     p.add_argument("--resume", action="store_true",
                    help="skip instance_ids already written for that run")
     p.add_argument("--stop_on_limit", dest="stop_on_limit", action="store_true",
                    default=True, help="stop the sweep after the first usage limit (default)")
     p.add_argument("--no-stop_on_limit", dest="stop_on_limit", action="store_false",
                    help="keep going after a usage limit instead of stopping")
+    p.add_argument("--no-wait-for-timed-path", dest="wait_for_timed_path",
+                   action="store_false", default=True,
+                   help="start even if analysis/timed_path.py is running (not advised)")
     args = p.parse_args()
 
-    if shutil.which("claude") is None:
-        sys.exit("error: the `claude` CLI is not on PATH")
     if args.num_runs < 1:
         sys.exit("error: --num_runs must be at least 1")
     if args.max_turns < 1:
         sys.exit("error: --max_turns must be at least 1")
 
+    token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    if not token:
+        sys.exit(
+            "error: CLAUDE_CODE_OAUTH_TOKEN is not set.\n"
+            "       Claude runs inside the container, which has no access to the\n"
+            "       macOS keychain, so the subscription token has to be passed in\n"
+            "       explicitly. Create one and export it:\n\n"
+            "           claude setup-token\n"
+            "           export CLAUDE_CODE_OAUTH_TOKEN='<the token it prints>'\n\n"
+            "       It is handed to the container as an environment variable only:\n"
+            "       never written to disk, an image, a log, or the provenance file."
+        )
+
     out_path = Path(args.output).resolve()
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_dir = Path(args.cache_dir).resolve(); cache_dir.mkdir(parents=True, exist_ok=True)
-    work_dir = Path(args.work_dir).resolve(); work_dir.mkdir(parents=True, exist_ok=True)
+    cli_cache = Path(args.cli_cache).resolve()
     log_root = out_path.parent / "claude_code_logs"; log_root.mkdir(parents=True, exist_ok=True)
 
     instances = load_instances(args)
@@ -665,13 +1508,27 @@ def main():
     if not instances:
         sys.exit("error: no instances selected")
 
-    version = claude_version()
-    print(f"[env] claude CLI: {version}, model: {args.model}")
+    if args.wait_for_timed_path:
+        wait_for_timed_path()
+
+    client = docker.from_env()
+    bootstrap_image = args.bootstrap_image or remote_image_key(instances[0]["instance_id"])
+    manifest, built = bootstrap_cli(client, cli_cache, bootstrap_image,
+                                    args.cli_version, effort=args.effort,
+                                    force=args.bootstrap_cli)
+    if not built:
+        print(f"[cli] reusing {manifest.get('claude_version')} from {cli_cache}")
+    if args.bootstrap_only:
+        print(json.dumps(manifest, indent=2))
+        return
+
+    print(f"[env] claude (in container): {manifest.get('claude_version')}, "
+          f"model: {args.model}, effort: {args.effort}")
 
     totals, stopped = {}, False
     for run_idx in range(1, args.num_runs + 1):
         counts, hit_limit = execute_run(run_idx, instances, args, out_path,
-                                        cache_dir, work_dir, log_root, version)
+                                        log_root, client, token, cli_cache, manifest)
         for k, v in counts.items():
             totals[k] = totals.get(k, 0) + v
         if hit_limit:
@@ -687,7 +1544,7 @@ def main():
     print(f"logs: {log_root}")
     if stopped:
         print("\nSTOPPED: hit a Claude usage/rate limit. No prediction was written "
-              "for the affected or cancelled instances, so rerun this same command "
+              "for the affected or unstarted instances, so rerun this same command "
               "later with --resume to pick them up.")
     if args.num_runs > 1:
         print("\nnote: evaluate each run separately, giving each its own --run_id "

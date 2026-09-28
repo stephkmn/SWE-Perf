@@ -63,6 +63,7 @@ For realistic settings, we provide implementations using different frameworks:
 
 - **OpenHands**: [OpenHands Inference Guide](/generation/realistic/README_OpenHands.md)
 - **Agentless**: [Agentless Inference Guide](/generation/realistic/README_Agentless.md)
+- **Claude Code**: [Claude Code Inference Guide](/generation/realistic/README_ClaudeCode.md)
 
 
 ## 📂 Data Collection Overview
