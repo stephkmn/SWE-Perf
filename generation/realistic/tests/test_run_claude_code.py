@@ -482,6 +482,17 @@ class TestFailureClassification:
         result = {"api_error_status": 500, "terminal_reason": "api_error"}
         assert classify_claude_failure(1, result, "") == "api_error"
 
+    def test_exhausted_turn_budget_is_named(self):
+        # Observed in the pilot: num_turns 101 against --max-turns 100 exits 1,
+        # which a bare exit-code status reports as an indistinguishable crash.
+        result = {"is_error": True, "subtype": "error_max_turns",
+                  "terminal_reason": "max_turns", "num_turns": 101}
+        assert classify_claude_failure(1, result, "") == "max_turns"
+
+    def test_max_turns_earns_no_prediction(self):
+        # Cut off mid-edit, exactly like a timeout.
+        assert not earns_a_prediction("max_turns")
+
     def test_a_plain_crash_keeps_the_exit_code(self):
         assert classify_claude_failure(2, None, "segfault") == "claude_exit_2"
 

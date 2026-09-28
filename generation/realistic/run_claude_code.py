@@ -171,6 +171,12 @@ def classify_claude_failure(rc, result, stderr) -> str:
     result = result or {}
     code = result.get("api_error_status")
     text = " ".join(x for x in (result.get("result_text", ""), stderr or "") if x)
+    # Exhausting the turn budget is a real experimental outcome, not a crash,
+    # and it exits 1 like everything else -- the first pilot reported it as a
+    # bare "claude_exit_1", which hides the one fact that explains the run.
+    # It still earns no prediction: like a timeout, it leaves a mid-edit tree.
+    if result.get("terminal_reason") == "max_turns" or result.get("subtype") == "error_max_turns":
+        return "max_turns"
     if code in (401, 403) or AUTH_ERROR_RE.search(text):
         return "auth_failed"
     if code == 429 or looks_like_usage_limit(text):
